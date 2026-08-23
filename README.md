@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="assets/qq-group.png" alt="code技术交流群" width="300" />
+</p>
+<p align="center"><strong>code技术交流群 · 群号：1073672527</strong> — QQ 扫码加入群聊</p>
+
+---
+
 # chatgpt_register
 
 批量注册 ChatGPT/Codex 账号并管理 OAuth 凭据的工具链。通过浏览器自动化完成邮箱/手机号注册，产出可导入 Sub2API 的 OAuth 会话凭据，附带账号维护、风控对抗与异常重登能力。
