@@ -1,0 +1,47 @@
+__pycache__/
+*.pyc
+.env
+backend/data/
+backend/profiles/*/
+backend/app.db
+frontend/node_modules/
+frontend/dist/
+
+# Debug / temporary artifacts
+debug_*.png
+debug_*.html
+_*.py
+_*.txt
+mail_dump.json
+
+# Capture / mitmproxy
+capture/
+
+# Output (verification diffs, logs)
+output/
+
+# Playwright CLI logs
+.playwright-cli/
+
+# pytest cache
+.pytest_cache/
+backend/.pytest_cache/
+
+# Profile browser data
+profile-*/
+.profile-*/
+
+# IDE / misc
+.omx/
+.workbuddy/
+
+# Logs
+*.log
+*.err
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Internal design docs (not for public)
+docs/

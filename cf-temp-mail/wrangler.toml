@@ -1,0 +1,14 @@
+name = "cf-temp-mail"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# KV namespace：先运行 `wrangler kv namespace create CF_TEMP_MAIL`，把返回的 id 填到这里
+[[kv_namespaces]]
+binding = "CF_TEMP_MAIL"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Email Routing：catch-all 绑定到本 Worker
+# 把 yourdomain.com 换成你的域名
+# 需要在 Cloudflare Dashboard → Email Routing → Routing rules 里配置 catch-all 发送到 Worker
+[[email.routes]]
+pattern = "catchall"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Quick ChatGPT AT"
+  short_description: "复用项目 profile 快速登录 ChatGPT 并捕获 web access_token。"
+  default_prompt: "复用项目账号 profile，直接登录 chatgpt.com 捕获 Bearer access_token 并写回数据库。"

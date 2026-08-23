@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repair ChatGPT Profiles"
+  short_description: "Repair ChatGPT web login profiles with three concurrent workers."
+  default_prompt: "Use $repair-chatgpt-profiles to repair ChatGPT web login profiles with access_token but no refresh_token."

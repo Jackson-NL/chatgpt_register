@@ -1,0 +1,13 @@
+{
+  "name": "cf-temp-mail",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
