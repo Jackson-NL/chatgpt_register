@@ -263,7 +263,7 @@ class RegistrationService:
             else:
                 emit_log("[system] 创建临时邮箱…")
             sms = SmsbowerClient()
-            # 为每个注册任务创建独立持久 profile，后续验货可复用同一浏览器环境
+            # 为每个注册任务创建独立持久 profile，后续 OAuth 可复用同一浏览器环境
             profile_path = make_profile_path(f"reg_{reg_id}")
             draft = json.loads(reg.result_json) if reg.result_json else {}
             preset_password = str(draft.get("temp_email_password") or gen_password())

@@ -86,7 +86,6 @@ export const api = {
     bulkTag: (body) => POST("/accounts/bulk-tag", body),
     detail: (id) => GET(`/accounts/${id}`),
     batch: (body) => POST("/accounts/batch", body),
-    verify: (id) => POST(`/accounts/${id}/verify`),
     oauthCountries: () => GET("/accounts/oauth/countries"),
     oauthLogs: (after = 0, limit = 300) => GET(`/accounts/oauth/logs?after=${encodeURIComponent(after)}&limit=${encodeURIComponent(limit)}`),
     oauthJobActive: () => GET("/accounts/oauth/jobs/active"),

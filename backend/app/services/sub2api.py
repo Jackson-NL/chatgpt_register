@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Account, AccountSub2APIUpload, utcnow
 from .registrator import OAUTH_CLIENT_ID
-from .verify import parse_jwt_exp
+from .token_utils import parse_jwt_exp
 
 
 RequestFn = Callable[..., Awaitable[httpx.Response]]

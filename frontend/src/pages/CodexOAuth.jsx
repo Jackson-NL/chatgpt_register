@@ -74,12 +74,6 @@ function statusMeta(status) {
   return { color: "info", label: "运行中", icon: Loader2 };
 }
 
-function verifiedMeta(value) {
-  if (value === "pass") return { color: "success", label: "通过" };
-  if (value === "fail") return { color: "danger", label: "失败" };
-  return { color: "neutral", label: "未验证" };
-}
-
 function timestamp() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
@@ -720,14 +714,12 @@ export default function CodexOAuth() {
                       <th className="th">邮箱来源</th>
                       <th className="th">profile</th>
                       <th className="th">OAuth</th>
-                      <th className="th">验活</th>
                       <th className="th">expires</th>
                       <th className="w-16 px-3 py-2" />
                     </tr>
                   </thead>
                   <tbody>
                     {visibleAccountRows.map((account) => {
-                      const verified = verifiedMeta(account.verified_result);
                       const eligible = isOAuthCandidate(account);
                       return (
                         <tr key={account.id} className={`tr-row ${selectedIds.includes(account.id) ? "bg-blue-50/60" : ""}`}>
@@ -739,7 +731,6 @@ export default function CodexOAuth() {
                           <td className="td">
                             <Badge color={eligible ? "info" : "neutral"} dot>{oauthRowStatusLabel(account)}</Badge>
                           </td>
-                          <td className="td"><Badge color={verified.color} dot>{verified.label}</Badge></td>
                           <td className="td tnum text-xs text-slate-500">{account.token_expires_at || "—"}</td>
                           <td className="td"><Button variant="ghost" size="sm" icon={<ClipboardList size={12} />} onClick={() => selectAccount(account)} title="填入单账号">使用</Button></td>
                         </tr>

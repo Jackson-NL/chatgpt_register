@@ -15,7 +15,8 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.db import Base
-from app.models import Account, Registration
+from app.db import release_expired_account_cooldowns
+from app.models import Account, HealthCheck, Registration
 from app.services.oauth_policy import (
     BLOCK_HAS_REFRESH_TOKEN,
     BLOCK_NO_PROFILE,
@@ -45,6 +46,24 @@ def _account(**overrides) -> Account:
 
 
 class OAuthPolicyTests(unittest.TestCase):
+    def test_expired_account_cooldown_becomes_active(self):
+        from datetime import datetime, timedelta, timezone
+
+        db = _db_session()
+        account = _account(
+            phone="expired_cooldown",
+            status="cooling",
+            warmup_until=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1),
+        )
+        db.add(account)
+        db.commit()
+        try:
+            self.assertEqual(release_expired_account_cooldowns(db), 1)
+            self.assertEqual(db.get(Account, account.id).status, "active")
+            self.assertIsNone(db.get(Account, account.id).warmup_until)
+        finally:
+            db.close()
+
     def test_gmail_with_profile_and_no_refresh_token_is_allowed(self):
         self.assertEqual(oauth_block_reason(_account()), "")
         self.assertTrue(oauth_eligibility(_account())["oauth_eligible"])
@@ -217,6 +236,44 @@ class OAuthEndpointEnforcementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(by_id[cf.id].mail_provider, "cf_temp_email")
             self.assertFalse(by_id[cf.id].oauth_eligible)
             self.assertTrue(by_id[cf.id].oauth_block_reason)
+        finally:
+            db.close()
+
+    async def test_list_accounts_returns_more_than_200_by_default(self):
+        from app.api import accounts as accounts_api
+
+        db = _db_session()
+        db.add_all(
+            _account(
+                phone=f"mail_reg_{index}",
+                email=f"account_{index}@example.com",
+            )
+            for index in range(201)
+        )
+        db.commit()
+        try:
+            self.assertEqual(len(accounts_api.list_accounts(db=db)), 201)
+            self.assertEqual(len(accounts_api.list_accounts(limit=5, db=db)), 5)
+        finally:
+            db.close()
+
+    def test_browser_verify_route_is_not_exposed(self):
+        from app.main import app
+
+        self.assertNotIn("/api/accounts/{account_id}/verify", app.openapi()["paths"])
+
+    def test_delete_account_removes_legacy_health_checks(self):
+        from app.api import accounts as accounts_api
+
+        db = _db_session()
+        account = _account(phone="delete_legacy_check")
+        db.add(account)
+        db.commit()
+        db.add(HealthCheck(account_id=account.id, check_type="browser", result="pass"))
+        db.commit()
+        try:
+            self.assertTrue(accounts_api.delete_account(account.id, db)["ok"])
+            self.assertEqual(db.query(HealthCheck).count(), 0)
         finally:
             db.close()
 

@@ -1,5 +1,7 @@
 from pathlib import Path
-from sqlalchemy import create_engine
+from datetime import datetime, timezone
+
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
@@ -21,9 +23,29 @@ class Base(DeclarativeBase):
 def get_db():
     db = SessionLocal()
     try:
+        release_expired_account_cooldowns(db)
         yield db
     finally:
         db.close()
+
+
+def release_expired_account_cooldowns(db) -> int:
+    """将到期的注册冷却账号恢复为可用状态。"""
+    from .models import Account
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    result = db.execute(
+        update(Account)
+        .where(
+            Account.status == "cooling",
+            Account.warmup_until.is_not(None),
+            Account.warmup_until <= now,
+        )
+        .values(status="active", warmup_until=None)
+    )
+    if result.rowcount:
+        db.commit()
+    return result.rowcount or 0
 
 
 def init_db():

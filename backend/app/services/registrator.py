@@ -3427,6 +3427,7 @@ class Registrator:
 
         captured_codes: list[str] = []
         phone_submitted = False
+        mfa_submitted = False
         phone_attempts = 0
         last_phone_error = ""
         successful_rental: dict | None = None
@@ -3496,6 +3497,15 @@ class Registrator:
                                 flush=True,
                             )
                             last_progress = now
+                        mfa_detected, mfa_submitted = await self._handle_oauth_mfa_challenge(
+                            page,
+                            totp_secret=totp_secret,
+                            submitted=mfa_submitted,
+                        )
+                        if mfa_detected:
+                            await asyncio.sleep(0.35)
+                            capture(page.url)
+                            continue
                         if not captured_codes:
                             # 页面卡死保护：手机号提交前 30s / 提交后(等回调) 120s 同一 URL 未变化即中止
                             stuck_after = 120 if phone_submitted else 30

@@ -1742,6 +1742,7 @@ class OAuthFromProfileTests(unittest.IsolatedAsyncioTestCase):
             patch.object(registrator_module, "fetch_authorize", side_effect=fake_fetch_authorize),
             patch.object(registrator_module.Registrator, "_fill_oauth_phone_form", fake_fill),
             patch.object(registrator_module.Registrator, "_submit_oauth_phone_and_wait_sms", fake_submit),
+            patch.object(registrator_module.Registrator, "_handle_oauth_mfa_challenge", new=AsyncMock(return_value=(False, False))) as handle_mfa,
             patch.object(registrator_module, "exchange_code", side_effect=fake_exchange_code),
             patch.object(registrator_module, "parse_id_token", return_value={
                 "account_id": "acc_oauth",
@@ -1760,6 +1761,7 @@ class OAuthFromProfileTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(camoufox_enters, 1)
+        self.assertGreaterEqual(handle_mfa.await_count, 1)
         self.assertEqual(submit_calls, 2)
         self.assertEqual(fake_context.pages[0].reload_calls, 1)
         self.assertEqual(len(fake_context.pages[0].goto_urls), 1)

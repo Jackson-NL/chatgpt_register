@@ -41,14 +41,11 @@ class AccountOut(OrmModel):
     tag: str = ""
     warmup_until: datetime | None = None
     created_at: datetime
-    last_check_at: datetime | None = None
     has_refresh_token: bool = False
     has_id_token: bool = False
     # 真实凭证状态（由列表/详情接口计算，非 ORM 字段）
     has_access_token: bool = False
     token_expires_at: datetime | None = None
-    verified_result: str | None = None
-    verified_at: datetime | None = None
     # 服务端脱敏后的凭证片段（列表页展示用，全文只在详情接口返回）
     access_token_masked: str | None = None
     refresh_token_masked: str | None = None

@@ -50,7 +50,6 @@ chatgpt_register/
 │  │     ├─ sub2api.py         Sub2API 上传客户端
 │  │     ├─ sub2api_relogin.py 异常账号重登
 │  │     ├─ clash_verge.py     Clash 代理轮换
-│  │     ├─ verify.py          浏览器内验货
 │  │     ├─ link_extraction.py 提链任务编排
 │  │     ├─ payment_link_extractor/  CS/OAICS Checkout、Stripe 支付链接提取
 │  │     └─ mail_providers/    邮箱 Provider（CF临时邮箱 / Outlook）
@@ -238,7 +237,6 @@ API 文档（Swagger UI）：`http://127.0.0.1:8000/docs`
 | `account_sub2api_uploads` | 账号在 Sub2API 各分组的状态 |
 | `link_extraction_jobs` / `link_extraction_items` | 提链任务、账号阶段和支付链接结果 |
 | `proxies` | 代理池 |
-| `health_checks` | 账号体检记录 |
 | `oauth_logs` | OAuth 日志持久化 |
 | `ui_settings` | 前端设置 JSON |
 

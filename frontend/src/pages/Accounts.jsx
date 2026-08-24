@@ -18,13 +18,11 @@ import { SUB2API_UPLOAD_STATUS_META, buildSub2APIUploadRequest, classifySub2APIU
 
 const PLAN_COLOR = { free: "neutral", plus: "info", pro: "primary", team: "warning", enterprise: "danger" };
 
-// 真实凭证状态：有 token 且未过期 → 看浏览器验货结果；无验货记录 → 未验证
+// 凭据状态仅由 access token 是否存在及过期时间判断。
 const credState = (a) => {
   if (!a.has_access_token) return { label: "无凭证", color: "neutral" };
   if (a.token_expires_at && new Date(a.token_expires_at).getTime() <= Date.now()) return { label: "已过期", color: "danger" };
-  if (a.verified_result === "pass") return { label: "存活", color: "success" };
-  if (a.verified_result === "fail") return { label: "已失效", color: "danger" };
-  return { label: "未验证", color: "warning" };
+  return { label: "凭据有效", color: "success" };
 };
 
 const ACC_STATUS = { active: ["success", "可用"], cooling: ["warning", "冷却中"], paused: ["neutral", "已暂停"], unhealthy: ["danger", "异常"], expired: ["neutral", "已过期"], deleted: ["neutral", "已删除"] };
@@ -69,16 +67,10 @@ const tokenExpiryText = (a) => {
   if (s < 86400) return `${Math.floor(s / 3600)} 小时后过期`;
   return `${Math.floor(s / 86400)} 天后过期`;
 };
-const verificationText = (a) => {
-  if (a.verified_result === "pass") return "最近验货通过";
-  if (a.verified_result === "fail") return "最近验货失败";
-  return "尚未浏览器验货";
-};
 const credentialFilter = (a) => {
   const state = credState(a).label;
-  if (state === "存活") return "alive";
-  if (state === "未验证") return "unverified";
-  if (state === "已失效" || state === "已过期") return "problem";
+  if (state === "凭据有效") return "alive";
+  if (state === "已过期") return "problem";
   return "missing";
 };
 
@@ -156,14 +148,9 @@ export default function Accounts() {
   { key: "tag", title: "标签", width: 130, render: (a) => a.tag ? (
     <Badge color="info">{a.tag}</Badge>
   ) : <span className="text-xs text-slate-300">—</span> },
-  { key: "credentialStatus", title: "健康", width: 150, sortable: true, render: (a) => {
+  { key: "credentialStatus", title: "凭据状态", width: 120, sortable: true, render: (a) => {
     const meta = credState(a);
-    return (
-      <div className="space-y-1">
-        <Badge color={meta.color} dot>{meta.label}</Badge>
-        <div className="text-[11px] leading-tight text-slate-400">{verificationText(a)}</div>
-      </div>
-    );
+    return <Badge color={meta.color} dot>{meta.label}</Badge>;
   }},
   { key: "cred", title: "OAuth 凭据", width: 280, sortable: false, render: (a) => (
     <div className="space-y-1.5">
@@ -181,11 +168,6 @@ export default function Accounts() {
       <CopyBtn state={copyState[`${a.id}:totp`]} title="复制 TOTP Secret" onCopy={() => copyToken(a, "totp")} />
     </div>
   ) : <Badge color="neutral">未绑定</Badge> },
-  { key: "last_check_at", title: "最近验货", width: 118, sortable: true, render: (a) => (
-    <div className="text-xs text-slate-500">
-      {a.last_check_at ? fmtAgo(new Date(a.last_check_at).getTime()) : <span className="text-slate-300">—</span>}
-    </div>
-  )},
   { key: "sub2api", title: "Sub2API", width: 150, sortable: false, render: (a) => {
     const badge = sub2apiUploadBadge(a.sub2api_upload_summary);
     return (
@@ -342,7 +324,6 @@ export default function Accounts() {
       filtered: rows.length,
       withAt: count((a) => a.has_access_token),
       withRt: count((a) => a.has_refresh_token),
-      unverified: count((a) => credentialFilter(a) === "unverified"),
       problem: count((a) => credentialFilter(a) === "problem"),
       missingProfile: count((a) => !a.profile_path),
     };
@@ -373,37 +354,9 @@ export default function Accounts() {
     }
   };
 
-  const doSingleVerify = async (id) => {
-    try {
-      const res = await api.accounts.verify(id);
-      if (res.ok) {
-        const alive = res.result === "pass";
-        toast(`账号 ${id} 验货完成: ${alive ? "存活" : "已失效"}（${(res.duration_ms / 1000).toFixed(1)}s）`, alive ? "success" : "error");
-      } else {
-        toast(`验货失败: ${res.error}`, "error");
-      }
-      reload();
-    } catch (e) {
-      toast(`验货失败: ${e.message}`, "error");
-    }
-  };
-
-  const doBatchVerify = async (ids) => {
-    try {
-      const res = await api.accounts.batch({ ids, action: "verify" });
-      const results = res.results || [];
-      const ok = results.filter((r) => r?.ok && r.result === "pass").length;
-      const fail = results.length - ok;
-      toast(`验货完成: ${results.length} 个 · ${ok} 存活 / ${fail} 失效`, fail === 0 ? "success" : ok > 0 ? "warning" : "error");
-      reload();
-    } catch (e) {
-      toast(`批量验货失败: ${e.message}`, "error");
-    }
-  };
-
   const [copyState, setCopyState] = useState({}); // `${id}:at|rt` -> "busy" | "done"
   const tokenCache = useRef(new Map()); // id -> { access_token, refresh_token, totp_secret } 完整凭证缓存
-  // 列表刷新（如验货后）后清掉旧缓存，避免复制到过期 token
+  // 列表刷新后清掉旧缓存，避免复制到过期 token
   useEffect(() => { tokenCache.current.clear(); }, [raw]);
 
   const writeClipboard = async (text) => {
@@ -529,7 +482,6 @@ export default function Accounts() {
     width: 210,
     render: (a) => (
       <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-        <Button variant="secondary" size="sm" icon={<ShieldCheck size={12} />} onClick={() => doSingleVerify(a.id)} title="浏览器验货">验货</Button>
         <Dropdown trigger={<IconBtn icon={<MoreHorizontal size={14} />} title="更多操作" />} items={[
           { label: "编辑元数据", icon: <FileText size={13} />, onClick: () => setEditAccount(a) },
           { label: a.status === "unhealthy" ? "恢复账号" : "暂停账号", danger: a.status !== "unhealthy",
@@ -549,7 +501,6 @@ export default function Accounts() {
   const doBatch = (action) => {
     setBatchAction(null);
     if (selected.length === 0) { toast("请先选择账号", "warning"); return; }
-    if (action === "verify") doBatchVerify(selected);
     if (action === "pause") doBatchPause(selected);
     if (action === "resume") doBatchResume(selected);
     if (action !== "tag") setSelected([]);
@@ -805,12 +756,11 @@ export default function Accounts() {
               <ShieldCheck size={13} /> AccountOps
             </div>
             <h1 className="mt-1 text-lg font-semibold text-slate-900">账号管理</h1>
-            <p className="mt-1 text-xs text-slate-500">集中查看账号、OAuth 凭据、2FA、profile 和浏览器验货状态；列表只展示脱敏值。</p>
+            <p className="mt-1 text-xs text-slate-500">集中查看账号、OAuth 凭据、2FA 和 profile 状态；列表只展示脱敏值。</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <StatPill label="账号总数" value={stats.total} tone="blue" helper={`当前筛选 ${stats.filtered}`} onClick={() => { setFCred("all"); setFHealth("all"); }} active={fCred === "all" && fHealth === "all"} />
             <StatPill label="已保存 AT / RT" value={`${stats.withAt}/${stats.withRt}`} tone="emerald" helper="可复制完整值" />
-            <StatPill label="未验证" value={stats.unverified} tone="amber" helper="点击筛选" onClick={() => setFCred("unverified")} active={fCred === "unverified"} />
             <StatPill label="异常 / 过期" value={stats.problem} tone="red" helper={`缺 Profile ${stats.missingProfile}`} onClick={() => setFCred("problem")} active={fCred === "problem"} />
           </div>
         </div>
@@ -822,7 +772,7 @@ export default function Accounts() {
           <SearchInput value={q} onChange={setQ} placeholder="检索 ID / 邮箱 / 手机 / 代理…" className="min-w-[260px]" />
           <Select options={[{ value: "all", label: "全部状态" }, { value: "active", label: "健康" }, { value: "cooling", label: "冷却中" }, { value: "paused", label: "已暂停" }, { value: "unhealthy", label: "异常" }]}
             value={fHealth} onChange={setFHealth} className="w-28" />
-          <Select options={[{ value: "all", label: "全部凭据" }, { value: "alive", label: "存活" }, { value: "unverified", label: "未验证" }, { value: "problem", label: "异常/过期" }, { value: "missing", label: "无凭证" }]}
+          <Select options={[{ value: "all", label: "全部凭据" }, { value: "alive", label: "凭据有效" }, { value: "problem", label: "已过期" }, { value: "missing", label: "无凭证" }]}
             value={fCred} onChange={setFCred} className="w-32" />
           <Select options={[{ value: "all", label: "全部计划" }, ...PLANS.map((p) => ({ value: p, label: p }))]}
             value={fPlan} onChange={setFPlan} className="w-28" />
@@ -860,7 +810,6 @@ export default function Accounts() {
         {selected.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 bg-blue-50/60 px-3 py-2 text-xs">
             <span className="rounded-full bg-blue-100 px-2 py-1 text-blue-700">已选 <b className="tnum">{selected.length}</b> 个账号</span>
-            <Button size="sm" variant="secondary" icon={<ShieldCheck size={13} />} onClick={() => doBatch("verify")}>验货所选</Button>
             <Button size="sm" variant="secondary" icon={<Pause size={13} />} onClick={() => setBatchAction("pause")}>暂停</Button>
             <Button size="sm" variant="secondary" icon={<Play size={13} />} onClick={() => setBatchAction("resume")}>恢复</Button>
             <Button size="sm" variant="secondary" icon={<Tag size={13} />} onClick={() => setBatchAction("tag")}>打标签</Button>
@@ -1281,8 +1230,8 @@ export default function Accounts() {
       <Confirm open={!!confirmDelete} onClose={() => setConfirmDelete(null)} danger
         title={confirmDelete?.kind === "batch" ? `删除所选 ${confirmDelete.ids.length} 个账号` : "删除账号"}
         message={confirmDelete?.kind === "batch"
-          ? `确定永久删除已选的 ${confirmDelete.ids.length} 个账号？将连带清除其验货记录，且不可恢复。`
-          : `确定永久删除「${confirmDelete?.account?.email || confirmDelete?.account?.phone || `#${confirmDelete?.account?.id}`}」？将连带清除其验货记录，且不可恢复。`}
+          ? `确定永久删除已选的 ${confirmDelete.ids.length} 个账号？此操作不可恢复。`
+          : `确定永久删除「${confirmDelete?.account?.email || confirmDelete?.account?.phone || `#${confirmDelete?.account?.id}`}」？此操作不可恢复。`}
         confirmText="确认删除" loading={deleting}
         onConfirm={() => {
           if (confirmDelete?.kind === "batch") doBatchDelete(confirmDelete.ids);
@@ -1318,7 +1267,6 @@ export default function Accounts() {
       <Drawer open={!!detail} onClose={() => setDetail(null)} width={680}
         title={detail ? `账号详情 · acc_${detail.id}` : ""}
         footer={<>
-          <Button variant="secondary" icon={<ShieldCheck size={13} />} onClick={() => doSingleVerify(detail.id)}>浏览器验货</Button>
           <Button variant="dangerSoft" icon={<Trash2 size={13} />} onClick={() => { setConfirmDelete({ kind: "single", account: detail }); setDetail(null); }}>删除账号</Button>
         </>}>
         {detail && (
@@ -1353,8 +1301,6 @@ export default function Accounts() {
                     ["状态", (ACC_STATUS[detail.status] || ["neutral", detail.status])[1]],
                     ["代理", detail.proxy || "—"],
                     ["浏览器 profile", detail.profile_path || "—"],
-                    ["验货结果", detailData?.verified_result ? (detailData.verified_result === "pass" ? "存活" : detailData.verified_result === "fail" ? "已失效" : detailData.verified_result) : "未验货"],
-                    ["最近验货", detailData?.verified_at ? fmtAgo(new Date(detailData.verified_at).getTime()) : "—"],
                     ["创建时间", detail.created_at ? fmtTime(new Date(detail.created_at).getTime()) : "—"],
                     ["标签", detailData?.tag || detail.tag || "—"],
                     ["备注", detailData?.note || detail.note || "—"],

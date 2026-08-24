@@ -2,10 +2,10 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
@@ -16,7 +16,7 @@ from ..models import Account, AccountSub2APIUpload, HealthCheck, Registration
 from ..schemas import AccountDetail, AccountOut, Sub2APIUploadSummary
 from ..services.sub2api import summarize_sub2api_upload_status
 from ..services.oauth_policy import oauth_block_reason, oauth_eligibility
-from ..services.verify import parse_jwt_exp
+from ..services.token_utils import parse_jwt_exp
 from ..services.registrator import RegisterError, Registrator, emit_log, get_oauth_logs
 from ..config import settings
 from ..services.clash_verge import rotate_clash_proxy_for_round
@@ -32,7 +32,7 @@ _SMSBOWER_RENT_LOCK = asyncio.Lock()
 
 class BatchBody(BaseModel):
     ids: list[int]
-    action: str  # pause / resume / check / verify
+    action: str  # pause / resume
 
 
 class TotpBody(BaseModel):
@@ -198,10 +198,6 @@ def _account_detail(account: Account, db: Session) -> AccountDetail:
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)
     item.note = account.note or ""
-    bc = _latest_browser_check(db, [account.id]).get(account.id)
-    if bc:
-        item.verified_result = bc.result
-        item.verified_at = bc.checked_at
     return item
 
 
@@ -294,7 +290,7 @@ def _account_cpa_payload(account: Account) -> dict:
         "access_token": account.access_token or "",
         "refresh_token": account.refresh_token or "",
         "account_id": account.account_id or "",
-        "last_refresh": _datetime_iso(account.last_check_at or account.created_at),
+        "last_refresh": _datetime_iso(account.oauth_refreshed_at or account.created_at),
         "email": account.email or "",
         "type": "codex",
         "expired": _datetime_iso(parse_jwt_exp(account.access_token)),
@@ -420,24 +416,6 @@ def import_account_records(db: Session, records: list[dict[str, str]], dedup: st
     return {"count": len(records), "success": success, "skipped": skipped, "failed": failed, "errors": errors[:50]}
 
 
-def _latest_browser_check(db: Session, account_ids: list[int]) -> dict[int, HealthCheck]:
-    """每个账号最新一条 browser 验货记录（按 id 倒序取首个）。"""
-    out: dict[int, HealthCheck] = {}
-    if not account_ids:
-        return out
-    rows = db.scalars(
-        select(HealthCheck)
-        .where(HealthCheck.account_id.in_(account_ids), HealthCheck.check_type == "browser")
-        .order_by(HealthCheck.id.desc())
-    ).all()
-    seen = set()
-    for h in rows:
-        if h.account_id not in seen:
-            out[h.account_id] = h
-            seen.add(h.account_id)
-    return out
-
-
 def _sub2api_upload_summaries(db: Session, account_ids: list[int]) -> dict[int, dict]:
     """批量计算账号的 Sub2API 上传概览（本地持久化状态，不含 token 明文）。"""
     out: dict[int, dict] = {}
@@ -459,7 +437,7 @@ def list_accounts(
     status: str | None = None,
     q: str | None = None,
     plan: str | None = None,
-    limit: int = 200,
+    limit: Annotated[int | None, Query(ge=1)] = None,
     db: Session = Depends(get_db),
 ):
     qs = select(Account)
@@ -470,8 +448,10 @@ def list_accounts(
     if q:
         kw = f"%{q}%"
         qs = qs.where(or_(Account.email.like(kw), Account.phone.like(kw), Account.id.cast(str).like(kw)))
-    accounts = db.scalars(qs.order_by(Account.id.desc()).limit(limit)).all()
-    checks = _latest_browser_check(db, [a.id for a in accounts])
+    qs = qs.order_by(Account.id.desc())
+    if limit is not None:
+        qs = qs.limit(limit)
+    accounts = db.scalars(qs).all()
     upload_summaries = _sub2api_upload_summaries(db, [a.id for a in accounts])
     out = []
     for a in accounts:
@@ -490,10 +470,6 @@ def list_accounts(
             item.sub2api_upload_summary = Sub2APIUploadSummary(**summary)
         else:
             item.sub2api_upload_summary = Sub2APIUploadSummary(status="not_uploaded")
-        bc = checks.get(a.id)
-        if bc:
-            item.verified_result = bc.result
-            item.verified_at = bc.checked_at
         out.append(item)
     return out
 
@@ -1090,10 +1066,6 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)
     item.note = account.note or ""
-    bc = _latest_browser_check(db, [account_id]).get(account_id)
-    if bc:
-        item.verified_result = bc.result
-        item.verified_at = bc.checked_at
     return item
 
 
@@ -1484,17 +1456,9 @@ async def refresh_oauth_from_profile(account_id: int, payload: OAuthRefreshBody,
     return _write_oauth_tokens(account, token_data, db)
 
 
-@router.post("/{account_id}/verify")
-async def verify_account(account_id: int):
-    """浏览器验货：Camoufox 内 fetch /me，真实判定 token 存活并落库。"""
-    from ..services.verify import VerifyService
-
-    return await VerifyService().verify_account(account_id)
-
-
 @router.delete("/{account_id}")
 def delete_account(account_id: int, db: Session = Depends(get_db)):
-    """删除账号：连带清理健康检查记录，解除注册关联。"""
+    """删除账号、历史检查记录并解除注册关联。"""
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(404, "账号不存在")
@@ -1518,16 +1482,4 @@ async def batch_action(payload: BatchBody, db: Session = Depends(get_db)):
             a.status = target
         db.commit()
         return {"ok": True, "count": len(accounts), "status": target}
-    if payload.action == "verify":
-        from ..services.verify import VerifyService
-
-        sem = asyncio.Semaphore(3)  # 浏览器实例重，限并发
-
-        async def _one(a):
-            async with sem:
-                return await VerifyService().verify_account(a.id)
-
-        results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
-        normalized = [r if isinstance(r, dict) else {"ok": False, "error": str(r)[:200]} for r in results]
-        return {"ok": True, "count": len(accounts), "results": normalized}
     raise HTTPException(400, "未知批量操作")
