@@ -2,6 +2,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services import browser_stack, http_client
@@ -61,6 +63,25 @@ def test_env_skips_context_only_kwargs_for_temporary_profile():
     assert "viewport" not in options
     assert "device_scale_factor" not in options
     assert "persistent_context" not in options
+
+
+def test_profile_lease_rejects_concurrent_access_for_same_profile():
+    async def run():
+        async with browser_stack.profile_lease("D:/profiles/worker_reg_1"):
+            with pytest.raises(browser_stack.ProfileInUseError, match="正在被其他任务使用"):
+                async with browser_stack.profile_lease("D:/profiles/worker_reg_1"):
+                    pass
+
+    asyncio.run(run())
+
+
+def test_profile_lease_allows_distinct_profiles():
+    async def run():
+        async with browser_stack.profile_lease("D:/profiles/worker_reg_1"):
+            async with browser_stack.profile_lease("D:/profiles/worker_reg_2"):
+                await asyncio.sleep(0)
+
+    asyncio.run(run())
 
 
 def test_detect_proxy_region_uses_proxy_and_returns_country(monkeypatch):

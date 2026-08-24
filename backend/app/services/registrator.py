@@ -14,7 +14,6 @@ from collections import deque
 
 import httpx
 from camoufox.async_api import AsyncCamoufox
-
 from ..config import settings
 from ..models import utcnow
 
@@ -29,6 +28,7 @@ except Exception:  # pragma: no cover
     stop_tracing = None
 from .browser_stack import (
     build_launch_options,
+    locked_camoufox,
     random_pace,
     click_best,
     find_label_text,
@@ -1732,7 +1732,7 @@ class Registrator:
 
         try:
             async with OAuthCallbackListener(redirect_uri, state) as callback_listener:
-                async with AsyncCamoufox(**launch_options) as browser:
+                async with locked_camoufox(launch_options, AsyncCamoufox) as browser:
                     context = await browser.new_context(locale="en-US")
                     page = await context.new_page()
                     page.on("response", lambda response: capture_callback_url(response.url))
@@ -2688,7 +2688,7 @@ class Registrator:
 
         try:
             async with OAuthCallbackListener(redirect_uri, state) as listener:
-                async with AsyncCamoufox(**launch_options) as browser:
+                async with locked_camoufox(launch_options, AsyncCamoufox) as browser:
                     is_persistent = launch_options.get("persistent_context", False)
                     if is_persistent:
                         context = browser
@@ -3461,7 +3461,7 @@ class Registrator:
 
         try:
             async with OAuthCallbackListener(redirect_uri, state) as listener:
-                async with AsyncCamoufox(**launch_options) as browser:
+                async with locked_camoufox(launch_options, AsyncCamoufox) as browser:
                     is_persistent = launch_options.get("persistent_context", False)
                     if is_persistent:
                         context = browser
@@ -3781,7 +3781,7 @@ class Registrator:
         while True:
             launch_options = build_launch_options(proxy, profile_path, headless=headless)
             try:
-                async with AsyncCamoufox(**launch_options) as browser:
+                async with locked_camoufox(launch_options, AsyncCamoufox) as browser:
                     is_persistent = launch_options.get("persistent_context", False)
                     if is_persistent:
                         context = browser
@@ -5362,7 +5362,7 @@ class Registrator:
 
         try:
             async with OAuthCallbackListener(redirect_uri, state) as listener:
-                async with AsyncCamoufox(**launch_options) as browser:
+                async with locked_camoufox(launch_options, AsyncCamoufox) as browser:
                     context = await browser.new_context(locale="en-US")
                     page = await context.new_page()
                     page.on("response", lambda r: capture(r.url))

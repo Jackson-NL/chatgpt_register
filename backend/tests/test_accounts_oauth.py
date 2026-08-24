@@ -111,19 +111,20 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeSms:
             async def get_prices(self, service, country):
-                calls.append(("prices", country))
-                return '{"6":{"dr":{}},"4":{"dr":{}},"16":{"dr":{}},"53":{"dr":{}}}'
+                calls.append(("prices", service, country))
+                return '{"6":{"ot":{}},"4":{"ot":{}},"16":{"ot":{}},"53":{"ot":{}}}'
 
         attempts = []
-        rental = await accounts_api._rent_smsbower_number(
-            FakeSms(),
-            ["印尼", "菲律宾", "英国", "沙特阿拉伯", "UK"],
-            0.03,
-            attempts,
-        )
+        with patch.object(accounts_api.settings, "smsbower_service", "ot"):
+            rental = await accounts_api._rent_smsbower_number(
+                FakeSms(),
+                ["印尼", "菲律宾", "英国", "沙特阿拉伯", "UK"],
+                0.03,
+                attempts,
+            )
 
         self.assertIsNone(rental)
-        self.assertEqual([country for _, country in calls], [6, 4, 16, 53])
+        self.assertEqual(calls, [("prices", "ot", country) for country in [6, 4, 16, 53]])
 
 
 
@@ -171,6 +172,7 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
         from app.api import accounts as accounts_api
 
         provider_calls = []
+        price_services = []
 
         class FakeSms:
             async def _get(self, action, **params):
@@ -182,28 +184,33 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError(action)
 
             async def get_prices(self, service, country):
-                return '{"6":{"dr":{"expensive":{"provider_id":"91","price":"0.030","count":"2"},"cheap":{"provider_id":"12","price":"0.014","count":"1"}}}}'
+                price_services.append(service)
+                return '{"6":{"ot":{"expensive":{"provider_id":"91","price":"0.030","count":"2"},"cheap":{"provider_id":"12","price":"0.014","count":"1"}}}}'
 
             async def set_status(self, activation_id, status):
                 return "ACCESS_READY"
 
         attempts = []
-        rental = await accounts_api._rent_smsbower_number(
-            FakeSms(),
-            ["ID"],
-            0.03,
-            attempts,
-            low_price_first=True,
-        )
+        with patch.object(accounts_api.settings, "smsbower_service", "ot"):
+            rental = await accounts_api._rent_smsbower_number(
+                FakeSms(),
+                ["ID"],
+                0.03,
+                attempts,
+                low_price_first=True,
+            )
 
         self.assertEqual(provider_calls, ["12"])
+        self.assertEqual(price_services, ["ot"])
         self.assertEqual(rental["provider_id"], "12")
         self.assertEqual(rental["listed_price"], "0.014")
+        self.assertEqual(attempts[0]["service"], "ot")
 
     async def test_rent_smsbower_number_falls_back_to_web_generic_endpoint(self):
         from app.api import accounts as accounts_api
 
         calls = []
+        price_services = []
 
         class FakeSms:
             async def _get(self, action, **params):
@@ -217,21 +224,25 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError(action)
 
             async def get_prices(self, service, country):
-                return '{"6":{"dr":{"provider":{"provider_id":"12","price":"0.014","count":"1"}}}}'
+                price_services.append(service)
+                return '{"6":{"ot":{"provider":{"provider_id":"12","price":"0.014","count":"1"}}}}'
 
             async def set_status(self, activation_id, status):
                 return "ACCESS_READY" if status == 1 else "ACCESS_CANCEL"
 
         attempts = []
-        rental = await accounts_api._rent_smsbower_number(
-            FakeSms(),
-            ["ID"],
-            0.014,
-            attempts,
-        )
+        with patch.object(accounts_api.settings, "smsbower_service", "ot"):
+            rental = await accounts_api._rent_smsbower_number(
+                FakeSms(),
+                ["ID"],
+                0.014,
+                attempts,
+            )
 
         get_number_calls = [params for action, params in calls if action == "getNumber"]
         self.assertEqual(len(get_number_calls), 2)
+        self.assertEqual(price_services, ["ot"])
+        self.assertTrue(all(call["service"] == "ot" for call in get_number_calls))
         self.assertEqual(get_number_calls[0]["providerIds"], "12")
         self.assertNotIn("providerIds", get_number_calls[1])
         self.assertEqual(rental["activation_id"], "act-generic")

@@ -7,6 +7,7 @@
 import asyncio
 import os
 import random
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from ..config import settings
@@ -21,6 +22,40 @@ WEBRTC_BLOCK_PREFS = {
     "media.peerconnection.ice.default_address_only": True,
     "media.navigator.enabled": False,
 }
+
+
+class ProfileInUseError(RuntimeError):
+    """Raised when another task in this process already owns a profile."""
+
+
+_PROFILE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _profile_lock_key(profile_path: str) -> str:
+    return os.path.normcase(os.path.abspath(profile_path))
+
+
+@asynccontextmanager
+async def profile_lease(profile_path: str):
+    """Reserve a persistent Firefox profile for one browser task at a time."""
+    if not profile_path:
+        yield
+        return
+
+    key = _profile_lock_key(profile_path)
+    lock = _PROFILE_LOCKS.setdefault(key, asyncio.Lock())
+    if lock.locked():
+        raise ProfileInUseError(f"浏览器 profile 正在被其他任务使用: {profile_path}")
+    async with lock:
+        yield
+
+
+@asynccontextmanager
+async def locked_camoufox(launch_options: dict, launcher):
+    """Launch Camoufox while holding the lease for its persistent profile."""
+    async with profile_lease(str(launch_options.get("user_data_dir") or "")):
+        async with launcher(**launch_options) as browser:
+            yield browser
 
 
 def build_launch_options(

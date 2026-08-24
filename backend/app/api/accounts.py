@@ -1147,6 +1147,8 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
     """按国家/价格上限租号；provider 定向失败时回退到通用租号。"""
     import json
 
+    service = (settings.smsbower_service or "dr").strip() or "dr"
+
     async with _SMSBOWER_RENT_LOCK:
         country_names_by_id: dict[int, str] = {}
         def _needs_country_lookup(country) -> bool:
@@ -1197,6 +1199,7 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
             attempt = {
                 "iso": iso,
                 "country": meta["country"],
+                "service": service,
                 "provider_id": provider_id,
                 "listed_price": listed_price,
                 "listed_count": listed_count,
@@ -1204,7 +1207,7 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
                 "low_price_first": low_price_first,
             }
             params = {
-                "service": "dr",
+                "service": service,
                 "country": str(meta["country"]),
                 "maxPrice": str(max_price),
             }
@@ -1261,10 +1264,10 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
             iso = meta["value"]
             providers = []
             try:
-                prices_text = await client.get_prices(service="dr", country=meta["country"])
+                prices_text = await client.get_prices(service=service, country=meta["country"])
                 data = json.loads(prices_text)
                 providers = [
-                    p for p in data.get(str(meta["country"]), {}).get("dr", {}).values()
+                    p for p in data.get(str(meta["country"]), {}).get(service, {}).values()
                     if float(p.get("price", 999)) <= max_price and int(p.get("count", 0)) > 0 and p.get("provider_id")
                 ]
                 providers.sort(
