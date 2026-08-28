@@ -110,6 +110,46 @@ def test_three_consecutive_gmail_otp_timeouts_cancel_the_activation(monkeypatch)
     assert session.expired_reason == "连续三轮验证码超时，已取消订单"
 
 
+def test_first_gmail_otp_timeout_cancels_activation_immediately(monkeypatch):
+    db = _db_session()
+    session = GmailSession(
+        base_email="first@gmail.com",
+        mail_id="mail-timeout-first",
+        alias_counter=1,
+        max_aliases=3,
+        status="active",
+    )
+    db.add(session)
+    db.flush()
+    reg = Registration(
+        status="failed",
+        gmail_alias="first+alias@gmail.com",
+        gmail_mail_id="mail-timeout-first",
+    )
+    db.add(reg)
+    db.commit()
+
+    from app.services import registrations as registration_service
+
+    cancel_calls = []
+
+    async def fake_set_status(self, mail_id, status=3):
+        cancel_calls.append((mail_id, status))
+
+    monkeypatch.setattr(registration_service.SmsbowerMailClient, "set_status", fake_set_status)
+
+    streak, canceled, error = asyncio.run(
+        registration_service._record_gmail_otp_timeout(db, reg)
+    )
+
+    db.refresh(session)
+    assert (streak, canceled, error) == (1, True, "")
+    assert cancel_calls == [("mail-timeout-first", 2)]
+    assert session.status == "expired"
+    assert session.expired_reason == "首轮验证码超时，已取消订单"
+    assert session.otp_timeout_streak == 1
+
+
 def test_first_next_alias_reuses_rented_activation(monkeypatch):
     """租号后第一次生成 alias 不应再次 getActivation，避免一次流程拿两个 Gmail。"""
     db = _db_session()

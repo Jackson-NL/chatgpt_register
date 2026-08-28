@@ -314,6 +314,14 @@ class MailProviderName(str, Enum):
     outlook = "outlook"
 
 
+class CustomPoolItem(BaseModel):
+    id: int
+    address: str
+    status: str
+    allocated_at: str | None = None
+    used_at: str | None = None
+
+
 class CFTempEmailConfig(BaseModel):
     """cf_temp_email 出参：不返回地址池明文或收件 JWT。"""
 
@@ -323,6 +331,8 @@ class CFTempEmailConfig(BaseModel):
     address_mode: str = "generated"
     custom_pool_count: int = 0
     custom_pool_sample: list[str] = []
+    custom_pool_status_counts: dict[str, int] = {}
+    custom_pool_items: list[CustomPoolItem] = []
     inbox_address: str = ""
     has_inbox_jwt: bool = False
     name_prefix: str = "reg"

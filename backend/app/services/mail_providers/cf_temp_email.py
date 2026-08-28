@@ -12,6 +12,8 @@ import threading
 import time
 
 from ...config import settings
+from ...db import SessionLocal
+from ...models import CustomMailbox, utcnow
 from ..tempmail import TempmailClient, TempmailError
 from .base import MailIdentity, MailProvider, MailProviderError, redact_error
 
@@ -75,8 +77,55 @@ def mask_custom_pool_sample(address: str) -> str:
     return f"{local}@{domain}"
 
 
-def release_custom_mailbox(address: str) -> None:
-    """释放注册任务占用的自定义地址；服务异常/取消时也可安全调用。"""
+def sync_custom_mailbox_pool(pool: list[str]) -> None:
+    """将配置地址池同步到持久化状态表，不重置既有使用记录。"""
+    normalized = {str(address).strip().lower() for address in pool if str(address).strip()}
+    db = SessionLocal()
+    try:
+        existing = {item.address: item for item in db.query(CustomMailbox).all()}
+        for address in normalized:
+            item = existing.get(address)
+            if item is None:
+                db.add(CustomMailbox(address=address, active=True, status="unused"))
+            else:
+                item.active = True
+                item.updated_at = utcnow()
+        for address, item in existing.items():
+            if address not in normalized and item.active:
+                item.active = False
+                item.updated_at = utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def custom_mailbox_pool_state(pool: list[str]) -> tuple[dict[str, int], list[dict]]:
+    """返回当前池的脱敏状态清单，地址明文不离开后端。"""
+    sync_custom_mailbox_pool(pool)
+    db = SessionLocal()
+    try:
+        items = db.query(CustomMailbox).filter(CustomMailbox.active.is_(True)).order_by(CustomMailbox.id).all()
+        counts = {status: 0 for status in ("unused", "in_use", "used", "failed")}
+        result = []
+        for item in items:
+            counts[item.status] = counts.get(item.status, 0) + 1
+            result.append({
+                "id": item.id,
+                "address": mask_custom_pool_sample(item.address),
+                "status": item.status,
+                "allocated_at": item.allocated_at.isoformat() if item.allocated_at else None,
+                "used_at": item.used_at.isoformat() if item.used_at else None,
+            })
+        return counts, result
+    finally:
+        db.close()
+
+
+def release_custom_mailbox(address: str, *, outcome: str = "failed", error: str = "") -> None:
+    """结束地址占用并写入终态；成功后不再回收到可分配池。"""
     normalized = (address or "").strip().lower()
     if not normalized:
         return
@@ -84,22 +133,51 @@ def release_custom_mailbox(address: str) -> None:
         key = _POOL_RESERVATIONS.pop(normalized, None)
         if key:
             _POOL_ACTIVE.get(key, set()).discard(normalized)
+    db = SessionLocal()
+    try:
+        item = db.query(CustomMailbox).filter(CustomMailbox.address == normalized).one_or_none()
+        if item and item.status == "in_use":
+            item.status = "used" if outcome == "used" else "failed"
+            item.used_at = utcnow()
+            item.last_error = "" if outcome == "used" else str(error or "注册未完成")[:500]
+            item.updated_at = utcnow()
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _reserve_custom_mailbox(pool: list[str], inbox_address: str) -> str:
+    sync_custom_mailbox_pool(pool)
     key = (tuple(pool), inbox_address.lower())
     with _POOL_LOCK:
         active = _POOL_ACTIVE.setdefault(key, set())
         start = _POOL_CURSOR.get(key, 0)
-        for offset in range(len(pool)):
-            index = (start + offset) % len(pool)
-            address = pool[index]
-            if address not in active:
+        db = SessionLocal()
+        try:
+            states = {item.address: item for item in db.query(CustomMailbox).filter(CustomMailbox.active.is_(True)).all()}
+            for offset in range(len(pool)):
+                index = (start + offset) % len(pool)
+                address = pool[index]
+                item = states.get(address)
+                if address in active or item is None or item.status != "unused":
+                    continue
+                item.status = "in_use"
+                item.allocated_at = utcnow()
+                item.last_error = ""
+                item.updated_at = utcnow()
+                db.commit()
                 active.add(address)
                 _POOL_RESERVATIONS[address] = key
                 _POOL_CURSOR[key] = (index + 1) % len(pool)
                 return address
-    raise MailProviderError(f"自定义邮箱池已耗尽：当前 {len(pool)} 个地址都在使用中")
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    raise MailProviderError(f"自定义邮箱池已耗尽：当前 {len(pool)} 个地址均已使用或不可用")
 
 
 class CFTempEmailProvider(MailProvider):

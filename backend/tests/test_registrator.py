@@ -12,6 +12,7 @@ from app.services.registrator import (
     AboutYouFinishTimeoutError,
     _birthday_iso,
     _birthday_segment_order,
+    _fill_react_aria_datefield,
     _should_retry_birthday_hidden_sync,
     _birthday_submission_ready,
     click_about_you_submit,
@@ -294,6 +295,135 @@ class BirthdayStateTests(unittest.TestCase):
                 react_aria_attempted=True,
             )
         )
+
+    def test_stale_hidden_date_is_not_considered_ready_even_when_segments_match(self):
+        self.assertFalse(
+            _birthday_submission_ready(
+                "1995-05-28",
+                hidden_value="0095-09-20",
+                spin_values=["28", "05", "1995"],
+                hidden_field_present=True,
+            )
+        )
+
+
+class ReactAriaBirthdayFillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_arrow_adjusts_segments_instead_of_accepting_bad_numeric_parse(self):
+        class FakeSegment:
+            def __init__(self, page, label, value):
+                self.page = page
+                self.label = label
+                self.value = int(value)
+                self.typed_values = []
+
+            async def get_attribute(self, name):
+                if name == "aria-label":
+                    return self.label
+                if name == "aria-valuenow":
+                    return str(self.value)
+                return ""
+
+            async def inner_text(self):
+                if "year" in self.label:
+                    return f"{self.value:04d}"
+                return f"{self.value:02d}"
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+            async def press(self, key):
+                if key == "ArrowUp":
+                    self.value += 1
+                    self.page.sync_hidden()
+                elif key == "ArrowDown":
+                    self.value -= 1
+                    self.page.sync_hidden()
+                elif key == "Tab":
+                    self.page.sync_hidden()
+
+            async def press_sequentially(self, value, delay=0):
+                self.typed_values.append(value)
+                # Regression guard: the old contenteditable typing path could
+                # mis-parse target day 17 as 21 while still updating React
+                # hidden state.  The fixed path should not need this branch.
+                if self.label.startswith("day") and value == "17":
+                    self.value = 21
+                else:
+                    self.value = int(value)
+                self.page.sync_hidden()
+
+            async def fill(self, value):
+                await self.press_sequentially(value)
+
+        class FakeSpinLocator:
+            def __init__(self, segments):
+                self.segments = segments
+
+            async def count(self):
+                return len(self.segments)
+
+            def nth(self, index):
+                return self.segments[index]
+
+        class FakeNameLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+        class FakePage:
+            def __init__(self):
+                self.segments = [
+                    FakeSegment(self, "day, ", 28),
+                    FakeSegment(self, "month, ", 8),
+                    FakeSegment(self, "year, ", 2026),
+                ]
+                self.hidden = "2026-08-28"
+
+            def locator(self, selector):
+                if selector == '[role="spinbutton"]':
+                    return FakeSpinLocator(self.segments)
+                if selector == 'input[name="name"]':
+                    return FakeNameLocator()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+            def sync_hidden(self):
+                day, month, year = (seg.value for seg in self.segments)
+                self.hidden = f"{year:04d}-{month:02d}-{day:02d}"
+
+            async def evaluate(self, _script):
+                return {
+                    "hiddenPresent": True,
+                    "hiddenValue": self.hidden,
+                    "spinValues": [
+                        f"{self.segments[0].value:02d}",
+                        f"{self.segments[1].value:02d}",
+                        f"{self.segments[2].value:04d}",
+                    ],
+                }
+
+        page = FakePage()
+
+        state = await _fill_react_aria_datefield(page, "1995-12-17", month=12, day=17, year=1995)
+
+        self.assertTrue(state["ready"])
+        self.assertEqual(state["hiddenValue"], "1995-12-17")
+        self.assertEqual(state["spinValues"], ["17", "12", "1995"])
+        self.assertEqual(page.segments[0].typed_values, [])
 
 
 class PasswordFillRetryTests(unittest.IsolatedAsyncioTestCase):

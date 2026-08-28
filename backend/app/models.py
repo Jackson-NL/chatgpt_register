@@ -245,6 +245,22 @@ class GmailSession(Base):
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class CustomMailbox(Base):
+    """自定义邮箱池地址的持久化使用状态。"""
+
+    __tablename__ = "custom_mailboxes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    address: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="unused", index=True)  # unused/in_use/used/failed
+    allocated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class UiSetting(Base):
     """前端设置 JSON 持久化（按 key 存整组配置）"""
 

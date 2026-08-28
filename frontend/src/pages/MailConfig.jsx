@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AtSign, CheckCircle2, Cloud, Eye, EyeOff, Inbox, KeyRound, Loader2, Mail,
-  RefreshCw, RotateCcw, Save, ShieldCheck, Users, XCircle,
+  RefreshCw, RotateCcw, Save, ShieldCheck, Users, XCircle, Upload,
+  Trash2, LockKeyhole, ClipboardPaste, ListChecks,
 } from "lucide-react";
 import { api } from "../api";
 import { useApp } from "../context/AppContext";
@@ -20,6 +21,8 @@ const DEFAULT_FORM = {
     custom_pool: "",
     custom_pool_count: 0,
     custom_pool_sample: [],
+    custom_pool_status_counts: { unused: 0, in_use: 0, used: 0, failed: 0 },
+    custom_pool_items: [],
     inbox_address: "",
     inbox_jwt: "",
     has_inbox_jwt: false,
@@ -69,6 +72,19 @@ function normalizeConfig(data) {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function parsePoolText(value) {
+  const seen = new Set();
+  const valid = [];
+  const invalid = [];
+  for (const raw of String(value || "").split(/[\n,;]+/)) {
+    const address = raw.trim().toLowerCase();
+    if (!address) continue;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) invalid.push(address);
+    else if (!seen.has(address)) { seen.add(address); valid.push(address); }
+  }
+  return { valid, invalid };
 }
 
 function fieldErrors(form) {
@@ -170,6 +186,11 @@ export default function MailConfig() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [poolEntries, setPoolEntries] = useState([]);
+  const [poolImport, setPoolImport] = useState("");
+  const [poolImportMode, setPoolImportMode] = useState("append");
+  const [poolImportOpen, setPoolImportOpen] = useState(false);
+  const [poolImportError, setPoolImportError] = useState("");
   const [touched, setTouched] = useState({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
   const [visible, setVisible] = useState({ sitePassword: false, inboxJwt: false, graphSecret: false });
 
@@ -180,8 +201,12 @@ export default function MailConfig() {
       const normalized = normalizeConfig(data);
       setForm(normalized);
       setServerForm(clone(normalized));
+      setPoolEntries([]);
       setUpdatedAt(data.updated_at || null);
       setLastTest(data.test_status || null);
+      setPoolEntries([]);
+      setPoolImport("");
+      setPoolImportError("");
       setTouched({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
     } catch (error) {
       toast(`邮箱配置加载失败: ${error.message}`, "error");
@@ -201,10 +226,40 @@ export default function MailConfig() {
     if (section === "outlook" && key === "graph_client_secret") setTouched((state) => ({ ...state, graphSecret: true }));
   };
 
+  const updatePool = (entries) => {
+    const unique = [...new Set(entries.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean))];
+    setPoolEntries(unique);
+    patch("cf_temp_email", "custom_pool", unique.join("\n"));
+  };
+
+  const importPool = () => {
+    const { valid, invalid } = parsePoolText(poolImport);
+    if (!valid.length) {
+      setPoolImportError(invalid.length ? `没有可导入的有效邮箱（${invalid.length} 条格式错误）` : "请先粘贴至少一个邮箱地址");
+      return;
+    }
+    if (poolImportMode === "append" && !poolEntries.length && form.cf_temp_email.custom_pool_count > 0) {
+      setPoolImportError("已保存地址明文不可回显；请导入完整地址后选择“替换全部地址”，避免覆盖旧地址");
+      return;
+    }
+    const next = poolImportMode === "replace" ? valid : [...poolEntries, ...valid];
+    updatePool(next);
+    setPoolImportError(invalid.length ? `已导入 ${valid.length} 条，忽略 ${invalid.length} 条格式错误` : `已导入 ${valid.length} 条地址`);
+    setPoolImport("");
+    if (!invalid.length) setPoolImportOpen(false);
+  };
+
   const errors = useMemo(() => fieldErrors(form), [form]);
   const dirty = useMemo(() => JSON.stringify(form) !== JSON.stringify(serverForm), [form, serverForm]);
   const cfConfigured = form.cf_temp_email.has_site_password;
   const graphConfigured = form.outlook.has_graph_client_secret;
+  const poolStatus = form.cf_temp_email.custom_pool_status_counts || {};
+  const poolStatusMeta = {
+    unused: { label: "未使用", color: "success" },
+    in_use: { label: "使用中", color: "info" },
+    used: { label: "已使用", color: "neutral" },
+    failed: { label: "失败", color: "danger" },
+  };
 
   const buildPayload = () => {
     const body = {
@@ -215,6 +270,8 @@ export default function MailConfig() {
     delete body.cf_temp_email.has_site_password;
     delete body.cf_temp_email.custom_pool_count;
     delete body.cf_temp_email.custom_pool_sample;
+    delete body.cf_temp_email.custom_pool_status_counts;
+    delete body.cf_temp_email.custom_pool_items;
     delete body.outlook.accounts_count;
     delete body.outlook.accounts_sample;
     delete body.outlook.has_graph_client_secret;
@@ -278,6 +335,7 @@ export default function MailConfig() {
   const reset = () => {
     if (!serverForm) return;
     setForm(clone(serverForm));
+    setPoolEntries([]);
     setTouched({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
     toast("已撤销未保存修改", "info");
   };
@@ -369,29 +427,35 @@ export default function MailConfig() {
               <FormNumber label="429 退避（秒）" value={form.cf_temp_email.rate_limit_backoff} error={errors.cf_rate_limit_backoff} onChange={(value) => patch("cf_temp_email", "rate_limit_backoff", value)} />
             </div>
             {form.cf_temp_email.address_mode === "custom_pool" && (
-              <div className="space-y-3 rounded-md border border-blue-100 bg-blue-50/40 p-3">
+              <div className="space-y-4 rounded-md border border-blue-100 bg-blue-50/40 p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="text-[13px] font-medium text-slate-700">自定义邮箱池</div>
-                    <div className="mt-0.5 text-[11px] text-slate-400">注册时使用池内地址；这些地址应已转发到下面的固定收件箱。</div>
+                    <div className="flex items-center gap-2 text-[13px] font-medium text-slate-700"><ListChecks size={15} className="text-blue-600" />自定义邮箱池</div>
+                    <div className="mt-1 text-[11px] text-slate-400">注册时从地址池取号，所有地址应转发到下方固定收件箱。</div>
                   </div>
-                  <Badge color={form.cf_temp_email.custom_pool_count ? "success" : "warning"}>
-                    {form.cf_temp_email.custom_pool_count} 个已配置
-                  </Badge>
+                  <div className="flex items-center gap-1.5">
+                    <Badge color={form.cf_temp_email.custom_pool_count ? "success" : "warning"}>{poolEntries.length || form.cf_temp_email.custom_pool_count} 个地址</Badge>
+                    {poolEntries.length > 0 && <Badge color="warning">待保存</Badge>}
+                  </div>
                 </div>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-slate-600">邮箱地址池</span>
-                  <textarea
-                    className={`input min-h-28 resize-y font-mono text-xs ${errors.custom_pool ? "border-red-400" : ""}`}
-                    value={form.cf_temp_email.custom_pool}
-                    placeholder={form.cf_temp_email.custom_pool_count ? `已配置 ${form.cf_temp_email.custom_pool_count} 个地址；输入新内容可替换` : "每行一个邮箱地址，例如 name@example.com"}
-                    onChange={(e) => patch("cf_temp_email", "custom_pool", e.target.value)}
-                  />
-                  {errors.custom_pool ? <span className="mt-1 block text-[11px] text-red-600">{errors.custom_pool}</span> : <span className="mt-1 block text-[11px] text-slate-400">保存后不会回显地址明文，只显示数量和脱敏样例。</span>}
-                </label>
-                {form.cf_temp_email.custom_pool_sample?.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5"><span className="text-[11px] text-slate-400">已保存样例：</span>{form.cf_temp_email.custom_pool_sample.map((sample) => <Badge key={sample} color="neutral">{sample}</Badge>)}</div>
-                )}
+                {!poolEntries.length && form.cf_temp_email.custom_pool_count > 0 && <div className="flex flex-wrap gap-1.5">{Object.entries(poolStatusMeta).map(([key, meta]) => <Badge key={key} color={meta.color}>{meta.label} {poolStatus[key] || 0}</Badge>)}</div>}
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2">
+                  <div className="flex items-center gap-2 text-xs text-slate-600"><LockKeyhole size={14} className="text-slate-400" />已保存地址仅返回脱敏样例，避免凭证泄露</div>
+                  <Button variant="secondary" size="sm" icon={<Upload size={13} />} onClick={() => { setPoolImportOpen(true); setPoolImportError(""); }}>批量导入</Button>
+                </div>
+                <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
+                  <div className="grid grid-cols-[1fr_auto] items-center border-b border-slate-100 bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-500"><span>邮箱地址</span><span>状态</span></div>
+                  {poolEntries.length > 0 ? poolEntries.map((entry) => (
+                    <div key={entry} className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-0">
+                      <span className="truncate font-mono text-xs text-slate-700">{entry}</span>
+                      <div className="flex items-center gap-2"><Badge color="warning">待保存</Badge><button type="button" title="移除地址" className="text-slate-400 hover:text-red-600" onClick={() => updatePool(poolEntries.filter((item) => item !== entry))}><Trash2 size={14} /></button></div>
+                    </div>
+                  )) : form.cf_temp_email.custom_pool_items?.length > 0 ? form.cf_temp_email.custom_pool_items.map((item) => (
+                    <div key={item.id} className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-0"><span className="font-mono text-xs text-slate-600">{item.address}</span><Badge color={poolStatusMeta[item.status]?.color || "neutral"} dot>{poolStatusMeta[item.status]?.label || item.status}</Badge></div>
+                  )) : <div className="px-3 py-6 text-center text-xs text-slate-400">地址池为空，请批量导入邮箱地址</div>}
+                </div>
+                {poolEntries.length === 0 && form.cf_temp_email.custom_pool_count > 0 && <div className="text-[11px] text-slate-400">地址以脱敏形式展示；如需修改池，请导入完整地址后选择“替换全部”。</div>}
+                {errors.custom_pool && <span className="block text-[11px] text-red-600">{errors.custom_pool}</span>}
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <Input label="固定收件 CF 邮箱" value={form.cf_temp_email.inbox_address} error={errors.inbox_address} placeholder="例如 jackson@708651.xyz" onChange={(e) => patch("cf_temp_email", "inbox_address", e.target.value)} />
                   <SecretInput
@@ -479,6 +543,25 @@ export default function MailConfig() {
         </Button>
         {lastTest && <span className={`flex items-center gap-1.5 text-xs ${lastTest.ok ? "text-emerald-600" : "text-red-600"}`}><KeyRound size={13} />{lastTest.message}</span>}
       </div>
+      {poolImportOpen && (
+        <div className="fixed inset-0 z-40 bg-slate-950/30" onMouseDown={(event) => { if (event.target === event.currentTarget) setPoolImportOpen(false); }}>
+          <aside className="absolute right-0 top-0 flex h-full w-full max-w-md flex-col bg-white shadow-2xl">
+            <div className="flex items-start justify-between border-b border-slate-200 px-5 py-4">
+              <div><div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><ClipboardPaste size={16} className="text-blue-600" />批量导入邮箱</div><div className="mt-1 text-xs text-slate-400">支持换行、逗号或分号分隔，系统会自动去重。</div></div>
+              <button type="button" title="关闭" className="text-slate-400 hover:text-slate-700" onClick={() => setPoolImportOpen(false)}><XCircle size={18} /></button>
+            </div>
+            <div className="flex-1 space-y-4 overflow-y-auto p-5">
+              <div className="grid grid-cols-2 gap-2 rounded-md bg-slate-100 p-1">
+                {[{ value: "append", label: "追加到待保存列表" }, { value: "replace", label: "替换全部地址" }].map((option) => <button key={option.value} type="button" onClick={() => setPoolImportMode(option.value)} className={`rounded px-2 py-1.5 text-xs font-medium ${poolImportMode === option.value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500"}`}>{option.label}</button>)}
+              </div>
+              <textarea autoFocus value={poolImport} onChange={(event) => { setPoolImport(event.target.value); setPoolImportError(""); }} className="input min-h-56 resize-y font-mono text-xs" placeholder="name@example.com\nsecond@example.com" />
+              {poolImportError && <div className={`rounded-md px-3 py-2 text-xs ${poolImportError.includes("忽略") ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>{poolImportError}</div>}
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500"><div className="mb-2 flex items-center gap-2 font-medium text-slate-700"><ListChecks size={14} />导入规则</div><div>• 自动去重并统一转为小写</div><div>• 无效格式不会进入地址池</div><div>• 替换全部会覆盖当前待保存列表</div></div>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-4"><Button variant="secondary" onClick={() => setPoolImportOpen(false)}>取消</Button><Button icon={<Upload size={14} />} onClick={importPool}>导入地址</Button></div>
+          </aside>
+        </div>
+      )}
     </div>
   );
 }

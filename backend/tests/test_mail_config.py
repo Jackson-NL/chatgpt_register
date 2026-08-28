@@ -1,5 +1,6 @@
 import sys
 import asyncio
+from uuid import uuid4
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,10 @@ from app.schemas import CFTempEmailUpdate, MailConfigUpdate
 from app.services.mail_providers.base import get_mail_provider
 from app.services.mail_providers.cf_temp_email import (
     CFTempEmailProvider,
+    custom_mailbox_pool_state,
     parse_custom_pool,
     release_custom_mailbox,
+    sync_custom_mailbox_pool,
     validate_custom_pool,
 )
 from app.services.tempmail import TempmailClient, TempmailError
@@ -34,9 +37,35 @@ def test_custom_pool_validation_does_not_echo_invalid_line_contents():
     assert errors == ["第 1 行邮箱格式不正确"]
 
 
-def test_custom_pool_provider_uses_fixed_inbox_and_mail_cursor(monkeypatch):
+def test_custom_pool_tracks_allocation_outcome_without_exposing_addresses(monkeypatch):
+    token = uuid4().hex
+    pool = [f"pool-state-unused-{token}@example.com", f"pool-state-failed-{token}@example.com"]
+    sync_custom_mailbox_pool(pool)
     monkeypatch.setattr(settings, "cf_temp_email_address_mode", "custom_pool")
-    monkeypatch.setattr(settings, "cf_temp_email_custom_pool", "first@example.com")
+    monkeypatch.setattr(settings, "cf_temp_email_custom_pool", "\n".join(pool))
+    monkeypatch.setattr(settings, "cf_temp_email_inbox_address", "inbox@example.com")
+    monkeypatch.setattr(settings, "cf_temp_email_inbox_jwt", "jwt-value")
+    provider = CFTempEmailProvider()
+
+    async def list_mails(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(provider.client, "list_parsed_mails", list_mails)
+    identity = asyncio.run(provider.create_address())
+    counts, items = custom_mailbox_pool_state(pool)
+    assert counts["in_use"] == 1
+    assert identity.address not in repr(items)
+
+    release_custom_mailbox(identity.address, outcome="failed", error="test failure")
+    counts, items = custom_mailbox_pool_state(pool)
+    assert counts["failed"] == 1
+    assert any(item["status"] == "failed" for item in items)
+
+
+def test_custom_pool_provider_uses_fixed_inbox_and_mail_cursor(monkeypatch):
+    address = f"pool-cursor-{uuid4().hex}@example.com"
+    monkeypatch.setattr(settings, "cf_temp_email_address_mode", "custom_pool")
+    monkeypatch.setattr(settings, "cf_temp_email_custom_pool", address)
     monkeypatch.setattr(settings, "cf_temp_email_inbox_address", "jackson@708651.xyz")
     monkeypatch.setattr(settings, "cf_temp_email_inbox_jwt", "jwt-value")
     provider = CFTempEmailProvider()
@@ -55,13 +84,13 @@ def test_custom_pool_provider_uses_fixed_inbox_and_mail_cursor(monkeypatch):
 
     async def run():
         identity = await provider.create_address()
-        assert identity.address == "first@example.com"
+        assert identity.address == address
         assert identity.credential == "jwt-value"
         assert identity.meta["inbox_address"] == "jackson@708651.xyz"
         assert await provider.wait_for_code(identity) == "222222"
 
     asyncio.run(run())
-    release_custom_mailbox("first@example.com")
+    release_custom_mailbox(address)
 
 
 def test_custom_pool_config_output_hides_pool_and_jwt(monkeypatch):
@@ -235,6 +264,7 @@ def test_mail_config_rejects_outlook_as_current_provider_when_disabled(monkeypat
 
 def test_cf_connection_test_redacts_sensitive_exception_text(monkeypatch):
     secret = "jwt=secret-jwt-value password=secret-password"
+    monkeypatch.setattr(settings, "cf_temp_email_address_mode", "generated")
     provider = CFTempEmailProvider()
 
     async def fail(*args, **kwargs):

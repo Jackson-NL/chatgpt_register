@@ -1180,20 +1180,72 @@ async def _fill_react_aria_datefield(page, iso: str, month: int, day: int, year:
     if len(order) != 3:
         return {"attempted": True, "ready": False, "hidden_present": False, "hidden_value": "", "spin_values": [], "order": order}
 
+    async def _read_segment_number(segment) -> int | None:
+        try:
+            raw = await segment.get_attribute("aria-valuenow")
+            if raw is None or raw == "":
+                raw = await segment.inner_text()
+            match = re.search(r"\d+", str(raw or ""))
+            return int(match.group(0)) if match else None
+        except Exception:
+            return None
+
+    async def _segment_matches(segment, expected: str) -> bool:
+        current = await _read_segment_number(segment)
+        if current is None:
+            return False
+        return current == int(expected)
+
+    async def _adjust_segment(segment, expected: str) -> bool:
+        """Use spinbutton semantics instead of typing into contenteditable.
+
+        React Aria DateField segments are not normal inputs.  Numeric typing can
+        be interpreted as incremental segment edits and has been observed to
+        turn target day 17 into submitted day 21.  Arrow adjustments update the
+        component's internal date state and the hidden birthday field together.
+        """
+        target = int(expected)
+        current = await _read_segment_number(segment)
+        if current is None:
+            return False
+        delta = target - current
+        if delta:
+            key = "ArrowUp" if delta > 0 else "ArrowDown"
+            for _ in range(abs(delta)):
+                await segment.press(key)
+                await page.wait_for_timeout(25)
+        await page.wait_for_timeout(80)
+        return await _segment_matches(segment, expected)
+
+    async def _type_segment(segment, expected: str) -> bool:
+        try:
+            await segment.press("Control+A")
+            await segment.press("Backspace")
+            await segment.press_sequentially(expected, delay=65)
+            await page.wait_for_timeout(120)
+            return await _segment_matches(segment, expected)
+        except Exception:
+            try:
+                await segment.fill(expected)
+                await page.wait_for_timeout(120)
+                return await _segment_matches(segment, expected)
+            except Exception:
+                return False
+
     for attempt in range(2):
         for index, value, _kind in order:
             segment = spins.nth(index)
             if not await segment.is_visible():
                 continue
             try:
-                # Locator.fill supports contenteditable React Aria segments and
-                # emits the input sequence consumed by the DateField state.
-                await segment.fill(value)
-            except Exception:
                 await segment.click()
-                await segment.press("Control+A")
-                await segment.press("Backspace")
-                await segment.press_sequentially(value, delay=55)
+                if not await _adjust_segment(segment, value):
+                    # Fallback only when the current segment value cannot be
+                    # driven with spinbutton arrows; verify immediately so a
+                    # mis-parsed contenteditable value does not get accepted.
+                    await _type_segment(segment, value)
+            except Exception:
+                continue
             await segment.press("Tab")
             await page.wait_for_timeout(160)
 
@@ -4762,23 +4814,6 @@ class Registrator:
                                     await page.wait_for_timeout(280)
                             except Exception:
                                 pass
-                            # JS 直接设置 spin 文本兜底（若键盘输入失效）
-                            try:
-                                cur = await page.evaluate("""() => Array.from(document.querySelectorAll('[role="spinbutton"]')).map(e => (e.textContent || '').trim()).join('/')""")
-                                if cur not in (mdy_dmy, mdy_mdy, f"{day}/{month}/{year}", f"{month}/{day}/{year}"):
-                                    await page.evaluate("""([d,m,y]) => {
-                                      const s = Array.from(document.querySelectorAll('[role="spinbutton"]'));
-                                      if (s.length>=3){
-                                        // 假设 DMY，兜底直接设文本与 aria-valuenow
-                                        const vals=[d,m,y];
-                                        const tryMDY=[m,d,y];
-                                        // 先试 DMY
-                                        s.forEach((el,i)=>{ el.textContent=vals[i]; el.setAttribute('aria-valuenow', vals[i]); el.dispatchEvent(new Event('input',{bubbles:true}));});
-                                      }
-                                    }""", [f"{day:02d}", f"{month:02d}", f"{year:04d}"])
-                                    await page.wait_for_timeout(200)
-                            except Exception:
-                                pass
                         else:
                             emit_log(f"[stage:profile] birthday spin cnt={cnt} <3 skip", flush=True)
                     except Exception as se:
@@ -5075,15 +5110,23 @@ class Registrator:
         await lock.acquire()
         result: dict | None = None
         retry_ctx = kwargs.get("retry_ctx")
+        failure = ""
         try:
             result = await self._register_by_email_once_impl(*args, **kwargs)
             return result
+        except BaseException as error:
+            failure = str(error)
+            raise
         finally:
-            # 单轮失败、about-you 重试或成功后都不再需要占用该地址。
+            # 地址只允许注册一次：成功标为已使用，失败保留失败状态供地址池审计。
             address = (result or {}).get("email") if isinstance(result, dict) else ""
             if not address and isinstance(retry_ctx, dict):
                 address = retry_ctx.get("email", "")
-            release_custom_mailbox(str(address or ""))
+            release_custom_mailbox(
+                str(address or ""),
+                outcome="used" if result else "failed",
+                error=failure,
+            )
             lock.release()
 
     async def _register_by_email_once_impl(self, proxy, profile_path, client_id, redirect_uri, headless: bool = False, bind_totp: bool = False, gmail_alias: str = "", gmail_mail_id: str = "", preset_password: str = "", reuse_email: str = "", reuse_password: str = "", reuse_code: str = "", retry_ctx: dict | None = None, live_update: Callable | None = None, debug_wait: Callable[[BaseException], Awaitable[None]] | None = None, debug_trace: bool = False, debug_should_pause: Callable[[BaseException], bool] | None = None) -> dict:

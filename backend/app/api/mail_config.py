@@ -68,9 +68,10 @@ def _persist_cf_custom_pool(value: str) -> None:
 
 
 def _config_out() -> MailConfigOut:
-    from ..services.mail_providers import mask_custom_pool_sample, validate_custom_pool
+    from ..services.mail_providers import custom_mailbox_pool_state, mask_custom_pool_sample, validate_custom_pool
 
     custom_pool, _ = validate_custom_pool(settings.cf_temp_email_custom_pool)
+    custom_pool_status_counts, custom_pool_items = custom_mailbox_pool_state(custom_pool)
     accounts = _outlook_accounts()
     return MailConfigOut(
         provider=settings.mail_provider or "cf_temp_email",
@@ -81,6 +82,8 @@ def _config_out() -> MailConfigOut:
             address_mode=settings.cf_temp_email_address_mode or "generated",
             custom_pool_count=len(custom_pool),
             custom_pool_sample=[mask_custom_pool_sample(address) for address in custom_pool[:3]],
+            custom_pool_status_counts=custom_pool_status_counts,
+            custom_pool_items=custom_pool_items,
             inbox_address=settings.cf_temp_email_inbox_address,
             has_inbox_jwt=bool(settings.cf_temp_email_inbox_jwt),
             name_prefix=settings.cf_temp_email_name_prefix,
@@ -171,13 +174,14 @@ def update_mail_config(payload: MailConfigUpdate):
             if not effective_jwt:
                 raise HTTPException(422, "固定收件邮箱 JWT 不能为空")
         if custom_pool is not None:
-            from ..services.mail_providers import validate_custom_pool
+            from ..services.mail_providers import sync_custom_mailbox_pool, validate_custom_pool
 
             _, pool_errors = validate_custom_pool(custom_pool)
             if pool_errors:
                 raise HTTPException(422, "自定义邮箱池格式错误：\n" + "\n".join(pool_errors))
             settings.cf_temp_email_custom_pool = custom_pool
             _persist_cf_custom_pool(custom_pool)
+            sync_custom_mailbox_pool(validate_custom_pool(custom_pool)[0])
         if inbox_jwt and inbox_jwt != _MASK:
             settings.cf_temp_email_inbox_jwt = inbox_jwt.strip()
             _persist_env("cf_temp_email_inbox_jwt", settings.cf_temp_email_inbox_jwt)

@@ -80,7 +80,7 @@ def _registration_placeholder_phone(db, reg_id: int) -> str:
 
 
 async def _record_gmail_otp_timeout(db, reg: Registration) -> tuple[int, bool, str]:
-    """累计同一 Gmail activation 的验证码超时，并在第三次取消远端订单。"""
+    """记录 Gmail activation 验证码超时；首轮立即取消，后续三次超时取消。"""
     if not reg.gmail_mail_id:
         return 0, False, ""
     session = db.scalar(select(GmailSession).where(GmailSession.mail_id == str(reg.gmail_mail_id)))
@@ -90,7 +90,8 @@ async def _record_gmail_otp_timeout(db, reg: Registration) -> tuple[int, bool, s
     session.otp_timeout_streak = int(session.otp_timeout_streak or 0) + 1
     streak = session.otp_timeout_streak
     session.updated_at = utcnow()
-    if streak < 3:
+    first_round = int(session.alias_counter or 0) == 1
+    if not first_round and streak < 3:
         db.commit()
         return streak, False, ""
 
@@ -110,10 +111,11 @@ async def _record_gmail_otp_timeout(db, reg: Registration) -> tuple[int, bool, s
             cancel_error = str(error)[:180]
 
     session.status = "expired"
+    timeout_reason = "首轮验证码超时" if first_round else "连续三轮验证码超时"
     session.expired_reason = (
-        "连续三轮验证码超时，已取消订单"
+        f"{timeout_reason}，已取消订单"
         if not cancel_error
-        else f"连续三轮验证码超时，取消订单失败: {cancel_error}"
+        else f"{timeout_reason}，取消订单失败: {cancel_error}"
     )
     session.expires_at = session.expires_at or utcnow()
     session.updated_at = utcnow()
@@ -427,15 +429,18 @@ class RegistrationService:
                         try:
                             streak, canceled, cancel_error = await _record_gmail_otp_timeout(db, reg)
                             if canceled:
+                                draft = json.loads(reg.result_json) if reg.result_json else {}
+                                first_round = int(draft.get("gmail_alias_counter") or 0) == 1
+                                timeout_label = "首轮验证码超时" if first_round else f"连续 {streak} 轮验证码超时"
                                 if cancel_error:
                                     emit_log(
-                                        f"[gmail] mail_id={reg.gmail_mail_id} 连续 {streak} 轮验证码超时；"
+                                        f"[gmail] mail_id={reg.gmail_mail_id} {timeout_label}；"
                                         f"取消订单失败: {cancel_error}"
                                     )
                                 else:
                                     emit_log(
-                                        f"[gmail] mail_id={reg.gmail_mail_id} 连续 {streak} 轮验证码超时；"
-                                        "已调用 SMSBower setStatus=2 取消订单"
+                                        f"[gmail] mail_id={reg.gmail_mail_id} {timeout_label}；"
+                                        "已调用 SMSBower setStatus=2 取消订单，下一轮将租新 Gmail"
                                     )
                             else:
                                 emit_log(
