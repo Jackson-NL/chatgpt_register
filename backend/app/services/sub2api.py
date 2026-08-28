@@ -1043,7 +1043,14 @@ class Sub2APIClient:
         return data if isinstance(data, dict) else {}
 
     async def batch_refresh(self, account_ids: list[str]) -> dict[str, Any]:
-        ids = [str(account_id).strip() for account_id in account_ids if str(account_id).strip()]
+        # Current Sub2API expects numeric account_ids as JSON numbers. Keep
+        # non-numeric IDs intact for older/deployed variants that use UUIDs.
+        ids: list[str | int] = []
+        for account_id in account_ids:
+            value = str(account_id).strip()
+            if not value:
+                continue
+            ids.append(int(value) if value.isdecimal() else value)
         if not ids:
             return {}
         payload, _ = await self._call_candidates(
@@ -1152,6 +1159,9 @@ class Sub2APIClient:
                             # Sub2API 的 group_ids 是全量替换语义，更新时必须携带旧分组并集，
                             # 否则给账号加新分组会把原有分组解绑。
                             settings["group_ids"] = desired_group_ids
+                            # 凭据替换接口不会同步展示名称；保持账号行与最新
+                            # email||password||2fa 凭据格式一致，避免旧名称残留。
+                            settings["name"] = payload["name"]
                         await self.update_account_settings(
                             str(remote_id),
                             settings,

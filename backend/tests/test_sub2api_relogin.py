@@ -29,6 +29,19 @@ class FakeResponse:
 
 
 class Sub2APIClientReloginTests(unittest.IsolatedAsyncioTestCase):
+    def test_remote_reauth_redirect_uses_sub2api_callback_by_default(self):
+        with patch.object(relogin_module.settings, "sub2api_base_url", "https://sub2api.example/"), patch.object(relogin_module.settings, "sub2api_reauth_redirect_uri", ""):
+            self.assertEqual(relogin_module._remote_reauth_redirect_uri(), "https://sub2api.example/auth/callback")
+
+    def test_remote_reauth_redirect_honors_explicit_callback(self):
+        with patch.object(relogin_module.settings, "sub2api_reauth_redirect_uri", "https://callback.example/openai/callback"):
+            self.assertEqual(relogin_module._remote_reauth_redirect_uri(), "https://callback.example/openai/callback")
+
+    def test_remote_callback_details_requires_matching_state_not_localhost(self):
+        callback = relogin_module._callback_details("https://sub2api.example/auth/callback?code=code-1&state=state-1", "state-1")
+        self.assertEqual(callback["code"], "code-1")
+        self.assertIsNone(relogin_module._callback_details("https://sub2api.example/auth/callback?code=code-1&state=other", "state-1"))
+
     async def test_normalizes_account_payload_and_error_signal(self):
         accounts = normalize_sub2api_accounts(
             {

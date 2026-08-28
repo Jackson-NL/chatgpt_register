@@ -97,6 +97,7 @@ copy .env.example .env
 - `CF_TEMP_EMAIL_ADDRESS_MODE` — `generated` 自动创建地址，或 `custom_pool` 使用自定义邮箱池
 - `CF_TEMP_EMAIL_CUSTOM_POOL` / `CF_TEMP_EMAIL_INBOX_ADDRESS` / `CF_TEMP_EMAIL_INBOX_JWT` — 自定义邮箱池地址、统一转发收件地址和收件凭证
 - `SUB2API_BASE_URL` / `SUB2API_ADMIN_API_KEY` — Sub2API 管理端地址和凭据（如需上传）
+- `SUB2API_REAUTH_REDIRECT_URI` — 可选的 Sub2API 远端 OAuth 回调地址；留空时使用 `${SUB2API_BASE_URL}/auth/callback`，重登不再占用本地 callback 端口。
 - `CLASH_CONTROLLER_URL` / `CLASH_CONTROLLER_SECRET` — Clash 控制器地址和密钥
 - `REGISTRATION_TAG` — 注册批次标签，自动写入新账号 `tag` 字段（可选）
 
@@ -120,6 +121,20 @@ npm install
 详见 [cf-temp-mail/README.md](cf-temp-mail/README.md)。
 
 ### 4. 启动服务
+
+Windows 可直接双击根目录的 `start.bat`（默认重启占用 `8000/5173` 的旧服务，并等待健康检查）：
+
+```bat
+start.bat
+```
+
+也可在 PowerShell 中直接运行启动实现：
+
+```powershell
+.\start.ps1
+```
+
+如需保留已运行服务，使用 `./start.ps1 -NoRestart`。
 
 后端（不要加 `--reload`，浏览器子进程需要稳定的事件循环）：
 

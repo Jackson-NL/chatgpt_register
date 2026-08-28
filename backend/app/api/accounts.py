@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -12,7 +13,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal, get_db
-from ..models import Account, AccountSub2APIUpload, HealthCheck, Registration
+from ..models import Account, AccountSub2APIUpload, HealthCheck, Registration, utcnow
 from ..schemas import AccountDetail, AccountOut, Sub2APIUploadSummary
 from ..services.sub2api import summarize_sub2api_upload_status
 from ..services.oauth_policy import oauth_block_reason, oauth_eligibility
@@ -24,10 +25,72 @@ from ..services.clash_verge import rotate_clash_proxy_for_round
 router = APIRouter()
 SUB2API_OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
-# Several OAuth workers can reach add-phone at the same time.  SMSBower's
-# price snapshot is not a reservation, so serialize the short rent operation
-# to avoid all workers racing the same provider inventory.
-_SMSBOWER_RENT_LOCK = asyncio.Lock()
+# Limit provider pressure globally while allowing the selected countries in a
+# single OAuth attempt to compete in parallel.
+_SMSBOWER_RENT_SEMAPHORE = asyncio.Semaphore(6)
+
+
+def _decimal_or_none(value) -> Decimal | None:
+    """Parse API price/count fields without float rounding at the price limit."""
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _smsbower_provider_candidates(payload: object, country: int, service: str, max_price: float) -> list[dict]:
+    """Flatten SMSBower price payloads, including nested web-style price tiers.
+
+    getPricesV3 is usually ``country -> service -> provider``. Some responses
+    group providers below a price/tier key, so only iterating ``.values()`` at
+    one fixed depth silently loses inventory that is visible in the web UI.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    country_node = payload.get(str(country), payload.get(country))
+    if not isinstance(country_node, dict):
+        return []
+    service_node = country_node.get(service)
+    if service_node is None:
+        wanted = service.lower()
+        service_node = next((value for key, value in country_node.items() if str(key).lower() == wanted), None)
+    if service_node is None:
+        return []
+
+    ceiling = _decimal_or_none(max_price)
+    if ceiling is None:
+        return []
+    found: dict[str, dict] = {}
+
+    def visit(node: object, path: tuple[str, ...] = ()) -> None:
+        if isinstance(node, list):
+            for index, item in enumerate(node):
+                visit(item, (*path, str(index)))
+            return
+        if not isinstance(node, dict):
+            return
+        provider_id = node.get("provider_id", node.get("providerId", node.get("id")))
+        price = _decimal_or_none(node.get("price", node.get("cost")))
+        count = _decimal_or_none(node.get("count", node.get("quantity", node.get("available"))))
+        if provider_id not in (None, "") and price is not None and count is not None:
+            if Decimal("0") < count and price <= ceiling:
+                candidate = {
+                    "provider_id": str(provider_id),
+                    "price": str(price),
+                    "count": int(count),
+                    "tier": "/".join(path) or "direct",
+                }
+                previous = found.get(candidate["provider_id"])
+                if previous is None or (Decimal(candidate["price"]), -candidate["count"]) < (Decimal(previous["price"]), -previous["count"]):
+                    found[candidate["provider_id"]] = candidate
+            return
+        for key, value in node.items():
+            if isinstance(value, (dict, list)):
+                visit(value, (*path, str(key)))
+
+    visit(service_node)
+    return list(found.values())
 
 
 class BatchBody(BaseModel):
@@ -842,10 +905,10 @@ async def _select_oauth_proxy(job: dict) -> str:
     if fallback and fallback != requested:
         fallback_ok, fallback_detail = await _probe_oauth_proxy(fallback)
         if fallback_ok:
-            # The dedicated 9098 Clash controller routes 7891, not the
-            # fallback 7890. Rotating it here would only waste time and would
-            # not change the egress used by the browser.
-            job["skip_oauth_rotation"] = True
+            # The dedicated 9098 controller routes 7891, while the fallback
+            # browser traffic uses 7890. Rotate the fallback's own controller
+            # once before the pool starts, then keep that egress stable.
+            job["skip_oauth_rotation"] = False
             job["proxy_rotation_controller_url"] = str(settings.clash_controller_url or "").strip()
             job["proxy_rotation_selector_name"] = str(settings.clash_selector_name or "").strip()
             emit_log(
@@ -914,8 +977,8 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
             try:
                 rotation = await asyncio.wait_for(
                     rotate_clash_proxy_for_round(
-                        controller_url=settings.oauth_clash_controller_url,
-                        selector_name=settings.oauth_clash_selector_name,
+                        controller_url=job.get("proxy_rotation_controller_url") or "",
+                        selector_name=job.get("proxy_rotation_selector_name") or "",
                         proxy=job.get("proxy") or settings.default_proxy,
                         log=lambda m: emit_log(m, flush=True),
                     ),
@@ -1149,73 +1212,73 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
 
     service = (settings.smsbower_service or "dr").strip() or "dr"
 
-    async with _SMSBOWER_RENT_LOCK:
-        country_names_by_id: dict[int, str] = {}
-        def _needs_country_lookup(country) -> bool:
-            raw = str(country or "").strip()
-            key = raw.upper()
-            resolved_iso = COUNTRY_ALIASES.get(key) or COUNTRY_ALIASES.get(raw) or key
-            return resolved_iso not in COUNTRY_META and not raw.lower().startswith("smsbower:") and not raw.isdigit()
+    country_names_by_id: dict[int, str] = {}
 
-        needs_country_lookup = any(_needs_country_lookup(country) for country in countries) or any(
-            str(country or "").strip().lower().startswith("smsbower:") for country in countries
-        )
-        if needs_country_lookup:
-            try:
-                raw_countries = json.loads(await client._get("getCountries"))
-                country_names_by_id = {
-                    int(cid): str(info.get("eng") or info.get("chn") or cid)
-                    for cid, info in raw_countries.items()
-                    if str(cid).isdigit()
-                }
-            except Exception as error:  # noqa: BLE001
-                emit_log(f"[oauth:auto-phone] 获取国家列表失败，继续使用本地映射: {str(error)[:160]}", flush=True)
+    def _needs_country_lookup(country) -> bool:
+        raw = str(country or "").strip()
+        key = raw.upper()
+        resolved_iso = COUNTRY_ALIASES.get(key) or COUNTRY_ALIASES.get(raw) or key
+        return resolved_iso not in COUNTRY_META and not raw.lower().startswith("smsbower:") and not raw.isdigit()
 
-        normalized = []
-        seen_country_ids: set[int] = set()
-        for country in countries:
-            raw = str(country or "").strip()
-            key = raw.upper()
-            iso = COUNTRY_ALIASES.get(key) or COUNTRY_ALIASES.get(raw) or key
-            if iso in COUNTRY_META:
-                meta = COUNTRY_META[iso]
-                country_id = int(meta["country"])
-                if country_id in seen_country_ids:
-                    continue
-                seen_country_ids.add(country_id)
-                normalized.append({"value": iso, "iso": iso, "country": country_id, "dialing_code": meta["dialing_code"], "name": meta["name"]})
-                continue
-            raw_id = raw.split(":", 1)[1] if raw.lower().startswith("smsbower:") else raw
-            try:
-                country_id = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            if country_id > 0 and country_id not in seen_country_ids:
-                seen_country_ids.add(country_id)
-                normalized.append({"value": f"smsbower:{country_id}", "iso": country_names_by_id.get(country_id, f"country_{country_id}"), "country": country_id, "dialing_code": "", "name": country_names_by_id.get(country_id, f"country_{country_id}")})
-
-        async def try_rent(meta: dict, *, provider_id: str = "", listed_price=None, listed_count=None, source: str) -> dict | None:
-            iso = str(meta["value"])
-            attempt = {
-                "iso": iso,
-                "country": meta["country"],
-                "service": service,
-                "provider_id": provider_id,
-                "listed_price": listed_price,
-                "listed_count": listed_count,
-                "source": source,
-                "low_price_first": low_price_first,
+    needs_country_lookup = any(_needs_country_lookup(country) for country in countries) or any(
+        str(country or "").strip().lower().startswith("smsbower:") for country in countries
+    )
+    if needs_country_lookup:
+        try:
+            raw_countries = json.loads(await client._get("getCountries"))
+            country_names_by_id = {
+                int(cid): str(info.get("eng") or info.get("chn") or cid)
+                for cid, info in raw_countries.items()
+                if str(cid).isdigit()
             }
-            params = {
-                "service": service,
-                "country": str(meta["country"]),
-                "maxPrice": str(max_price),
-            }
-            if provider_id:
-                params["providerIds"] = provider_id
-            try:
+        except Exception as error:  # noqa: BLE001
+            emit_log(f"[oauth:auto-phone] 获取国家列表失败，继续使用本地映射: {str(error)[:160]}", flush=True)
+
+    normalized = []
+    seen_country_ids: set[int] = set()
+    for country in countries:
+        raw = str(country or "").strip()
+        key = raw.upper()
+        iso = COUNTRY_ALIASES.get(key) or COUNTRY_ALIASES.get(raw) or key
+        if iso in COUNTRY_META:
+            meta = COUNTRY_META[iso]
+            country_id = int(meta["country"])
+            if country_id in seen_country_ids:
+                continue
+            seen_country_ids.add(country_id)
+            normalized.append({"value": iso, "iso": iso, "country": country_id, "dialing_code": meta["dialing_code"], "name": meta["name"]})
+            continue
+        raw_id = raw.split(":", 1)[1] if raw.lower().startswith("smsbower:") else raw
+        try:
+            country_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if country_id > 0 and country_id not in seen_country_ids:
+            seen_country_ids.add(country_id)
+            normalized.append({"value": f"smsbower:{country_id}", "iso": country_names_by_id.get(country_id, f"country_{country_id}"), "country": country_id, "dialing_code": "", "name": country_names_by_id.get(country_id, f"country_{country_id}")})
+
+    async def try_rent(meta: dict, *, provider_id: str = "", listed_price=None, listed_count=None, source: str) -> dict | None:
+        iso = str(meta["value"])
+        attempt = {
+            "iso": iso,
+            "country": meta["country"],
+            "service": service,
+            "provider_id": provider_id,
+            "listed_price": listed_price,
+            "listed_count": listed_count,
+            "source": source,
+            "low_price_first": low_price_first,
+        }
+        params = {
+            "service": service,
+            "country": str(meta["country"]),
+            "maxPrice": str(max_price),
+        }
+        if provider_id:
+            params["providerIds"] = provider_id
+        try:
+            async with _SMSBOWER_RENT_SEMAPHORE:
                 text = await client._get("getNumber", **params)
-                attempt["raw"] = text[:220]
                 if text.startswith("ACCESS_NUMBER"):
                     parts = text.split(":", 2)
                     if len(parts) != 3 or not parts[1] or not parts[2]:
@@ -1233,80 +1296,106 @@ async def _rent_smsbower_number(client, countries: list[str], max_price: float, 
                         except Exception:
                             pass
                         return None
-                    attempt.update({"ok": True, "activation_id": activation_id, "phone": phone, "set_status_ready": ready})
-                    attempts_log.append(attempt)
-                    emit_log(
-                        f"[oauth:auto-phone] 已租号 iso={iso} activation_id={activation_id} provider={provider_id or 'auto'} "
-                        f"source={source} price={listed_price or 'api'} phone={phone}",
-                        flush=True,
-                    )
-                    return {
-                        "activation_id": activation_id,
-                        "phone": phone,
-                        "country_iso": meta.get("iso") or iso,
-                        "country_name": meta.get("name") or iso,
-                        "dialing_code": meta.get("dialing_code", ""),
-                        "provider_id": provider_id,
-                        "listed_price": listed_price,
-                    }
-                attempt.update({"ok": False, "error": text[:200]})
-            except Exception as error:  # noqa: BLE001
-                attempt.update({"ok": False, "error": str(error)[:200]})
-            attempts_log.append(attempt)
-            emit_log(
-                f"[oauth:auto-phone] 租号失败 country={iso} provider={provider_id or 'auto'} source={source} "
-                f"reason={attempt.get('error') or 'unknown'}",
-                flush=True,
-            )
-            return None
-
-        for meta in normalized:
-            iso = meta["value"]
-            providers = []
-            try:
-                prices_text = await client.get_prices(service=service, country=meta["country"])
-                data = json.loads(prices_text)
-                providers = [
-                    p for p in data.get(str(meta["country"]), {}).get(service, {}).values()
-                    if float(p.get("price", 999)) <= max_price and int(p.get("count", 0)) > 0 and p.get("provider_id")
-                ]
-                providers.sort(
-                    key=(
-                        (lambda p: (float(p.get("price", 999)), -int(p.get("count", 0))))
-                        if low_price_first
-                        else (lambda p: (-float(p.get("price", 0)), -int(p.get("count", 0))))
-                    )
-                )
+            attempt["raw"] = text[:220]
+            if text.startswith("ACCESS_NUMBER"):
+                attempt.update({"ok": True, "activation_id": activation_id, "phone": phone, "set_status_ready": ready})
+                attempts_log.append(attempt)
                 emit_log(
-                    f"[oauth:auto-phone] 库存快照 country={iso} eligible_providers={len(providers)} max_price={max_price}",
+                    f"[oauth:auto-phone] 已租号 iso={iso} activation_id={activation_id} provider={provider_id or 'auto'} "
+                    f"source={source} price={listed_price or 'api'} phone={phone}",
                     flush=True,
                 )
-            except Exception as error:  # noqa: BLE001
-                attempts_log.append({"iso": iso, "stage": "prices", "ok": False, "error": str(error)[:200]})
-                emit_log(f"[oauth:auto-phone] 价格查询失败 country={iso}: {str(error)[:160]}", flush=True)
-
-            for provider in providers:
-                rental = await try_rent(
-                    meta,
-                    provider_id=str(provider.get("provider_id")),
-                    listed_price=provider.get("price"),
-                    listed_count=provider.get("count"),
-                    source="provider",
-                )
-                if rental:
-                    return rental
-
-            # The web registration flow uses this API form.  Provider inventory
-            # can become stale between getPricesV3 and getNumber, while the
-            # generic endpoint can still select a currently available number.
-            rental = await try_rent(meta, source="generic_fallback")
-            if rental:
-                return rental
+                return {
+                    "activation_id": activation_id,
+                    "phone": phone,
+                    "country_iso": meta.get("iso") or iso,
+                    "country_id": meta["country"],
+                    "country_name": meta.get("name") or iso,
+                    "dialing_code": meta.get("dialing_code", ""),
+                    "provider_id": provider_id,
+                    "listed_price": listed_price,
+                }
+            attempt.update({"ok": False, "error": text[:200]})
+        except Exception as error:  # noqa: BLE001
+            attempt.update({"ok": False, "error": str(error)[:200]})
+        attempts_log.append(attempt)
         emit_log(
-            f"[oauth:auto-phone] 本轮所有国家均未租到手机号 countries={[item['value'] for item in normalized]} max_price={max_price}",
+            f"[oauth:auto-phone] 租号失败 country={iso} provider={provider_id or 'auto'} source={source} "
+            f"reason={attempt.get('error') or 'unknown'}",
             flush=True,
         )
         return None
+
+    async def load_providers(meta: dict) -> list[dict]:
+        iso = meta["value"]
+        try:
+            prices_text = await client.get_prices(service=service, country=meta["country"])
+            data = json.loads(prices_text)
+            providers = _smsbower_provider_candidates(data, meta["country"], service, max_price)
+            providers.sort(
+                key=(
+                    (lambda p: (Decimal(p["price"]), -int(p["count"])))
+                    if low_price_first
+                    else (lambda p: (-Decimal(p["price"]), -int(p["count"])))
+                )
+            )
+            emit_log(
+                f"[oauth:auto-phone] 库存快照 country={iso} eligible_providers={len(providers)} "
+                f"price_tiers={[p['price'] for p in providers]} max_price={max_price}",
+                flush=True,
+            )
+            return providers
+        except Exception as error:  # noqa: BLE001
+            attempts_log.append({"iso": iso, "stage": "prices", "ok": False, "error": str(error)[:200]})
+            emit_log(f"[oauth:auto-phone] 价格查询失败 country={iso}: {str(error)[:160]}", flush=True)
+            return []
+
+    # Price reads are independent and often dominate a multi-country round.
+    # Do them together, then race the same price tier across selected countries.
+    provider_sets = await asyncio.gather(*(load_providers(meta) for meta in normalized))
+    async def settle_race(rentals: list[dict | None]) -> dict | None:
+        winner = next((rental for rental in rentals if rental), None)
+        if not winner:
+            return None
+        losers = [
+            str(rental.get("activation_id") or "")
+            for rental in rentals
+            if rental and rental is not winner and rental.get("activation_id")
+        ]
+        if losers:
+            await asyncio.gather(*(client.set_status(activation_id, 8) for activation_id in losers), return_exceptions=True)
+            emit_log(f"[oauth:auto-phone] 并发取号命中，已释放 {len(losers)} 个未采用订单", flush=True)
+        return winner
+
+    max_tiers = max((len(providers) for providers in provider_sets), default=0)
+    for tier_index in range(max_tiers):
+        tier_tasks = []
+        for meta, providers in zip(normalized, provider_sets):
+            if tier_index >= len(providers):
+                continue
+            provider = providers[tier_index]
+            tier_tasks.append(try_rent(
+                meta,
+                provider_id=str(provider.get("provider_id")),
+                listed_price=provider.get("price"),
+                listed_count=provider.get("count"),
+                source=f"provider_tier_{tier_index + 1}",
+            ))
+        rental = await settle_race(await asyncio.gather(*tier_tasks))
+        if rental:
+            return rental
+
+    # Only use provider-agnostic allocation after every visible price tier in
+    # every selected country has had a chance. It keeps generic allocation from
+    # masking inventory in a later country or price tier.
+    rental = await settle_race(await asyncio.gather(*(try_rent(meta, source="generic_fallback") for meta in normalized)))
+    if rental:
+        return rental
+    emit_log(
+        f"[oauth:auto-phone] 本轮所有国家均未租到手机号 countries={[item['value'] for item in normalized]} max_price={max_price}",
+        flush=True,
+    )
+    return None
 
 
 def _write_oauth_tokens(account: Account, token_data: dict, db: Session) -> AccountDetail:
@@ -1323,6 +1412,9 @@ def _write_oauth_tokens(account: Account, token_data: dict, db: Session) -> Acco
     account.oauth_refresh_status = "success"
     account.oauth_refresh_error = ""
     account.oauth_refreshed_at = datetime.now(timezone.utc)
+    account.profile_last_used_at = utcnow()
+    if not account.profile_source or account.profile_source == "unknown":
+        account.profile_source = "oauth"
     db.commit()
     db.refresh(account)
     emit_log(
@@ -1466,11 +1558,22 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
     if not account:
         raise HTTPException(404, "账号不存在")
     ident = account.email or account.phone or f"acc_{account_id}"
+    profile_path = account.profile_path or ""
     db.query(HealthCheck).filter(HealthCheck.account_id == account_id).delete()
     db.query(AccountSub2APIUpload).filter(AccountSub2APIUpload.account_id == account_id).delete()
     db.query(Registration).filter(Registration.account_id == account_id).update({"account_id": None})
     db.delete(account)
     db.commit()
+    if profile_path:
+        from ..services.profile_lifecycle import profile_has_runtime_lock, remove_profile_tree
+
+        try:
+            if not profile_has_runtime_lock(profile_path):
+                remove_profile_tree(profile_path)
+        except (OSError, ValueError):
+            # Account deletion must remain successful even if a stale/foreign
+            # profile cannot be removed; the path is outside the DB contract.
+            pass
     return {"ok": True, "id": account_id, "deleted": ident}
 
 

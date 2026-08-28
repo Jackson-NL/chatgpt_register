@@ -16,6 +16,7 @@ import {
   REGISTER_LAYOUT, REGISTER_STAGES, buildRegisterPayload, filterRegisterRecords,
   advanceRegisterStage, formatRegDuration, formatRegistrationCopy, getRegistrationRecordSummary, isRunningStatus, isTaskMissingError,
   normalizeRegisterStatus, normalizeRegisterConfig, paginateRecords, parseRegisterResult, readStoredRegisterConfig, saveStoredRegisterConfig,
+  pickDisplayRegister,
 } from "./registerUtils";
 
 const STATUS_META = {
@@ -580,18 +581,8 @@ export default function Register() {
     };
   }), [history]);
 
-  const historyRunningReg = historyRows.find((r) => isRunningStatus(r.status)) || null;
-  const batchFocusedReg = batchActive?.status === "running"
-    ? batchActive.registrations?.find((r) => isRunningStatus(r.status)) || batchActive.registrations?.[0] || null
-    : null;
   const batchIsRunning = batchActive?.status === "running";
-  const focusedBatchReg = focusedReg && batchActive?.id && focusedReg.batch_id === batchActive.id
-    ? focusedReg
-    : null;
-  // 点击的记录始终优先，避免批量运行时无法查看已失败任务的原因和日志。
-  const displayReg = focusedReg || (batchIsRunning
-    ? (batchFocusedReg || focusedBatchReg || null)
-    : (historyRunningReg || active || historyRows[0] || null));
+  const displayReg = pickDisplayRegister({ focusedReg, batchActive, active, historyRows });
   const displayResult = parseRegisterResult(displayReg);
   const displayActive = !!displayReg && isRunningStatus(displayReg.status);
 

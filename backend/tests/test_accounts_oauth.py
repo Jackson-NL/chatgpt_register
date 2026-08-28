@@ -2,6 +2,7 @@
 import sys
 import unittest
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -86,6 +87,75 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
         payload = CodexOAuthJobBody(account_ids=[1])
 
         self.assertEqual(payload.concurrency, 3)
+
+    async def test_oauth_proxy_fallback_rotates_the_fallback_controller(self):
+        from app.api import accounts as accounts_api
+
+        job = {}
+        with (
+            patch.object(accounts_api.settings, "oauth_proxy", "http://127.0.0.1:7891"),
+            patch.object(accounts_api.settings, "default_proxy", "http://127.0.0.1:7890"),
+            patch.object(accounts_api.settings, "oauth_clash_controller_url", "http://127.0.0.1:9098"),
+            patch.object(accounts_api.settings, "oauth_clash_selector_name", "oauth-selector"),
+            patch.object(accounts_api.settings, "clash_controller_url", "http://127.0.0.1:9090"),
+            patch.object(accounts_api.settings, "clash_selector_name", "default-selector"),
+            patch.object(
+                accounts_api,
+                "_probe_oauth_proxy",
+                new=AsyncMock(side_effect=[(False, "connection refused"), (True, "203.0.113.9")]),
+            ),
+        ):
+            proxy = await accounts_api._select_oauth_proxy(job)
+
+        self.assertEqual(proxy, "http://127.0.0.1:7890")
+        self.assertFalse(job["skip_oauth_rotation"])
+        self.assertEqual(job["proxy_rotation_controller_url"], "http://127.0.0.1:9090")
+        self.assertEqual(job["proxy_rotation_selector_name"], "default-selector")
+
+    async def test_oauth_job_rotates_the_controller_selected_for_its_proxy(self):
+        from app.api import accounts as accounts_api
+
+        job_id = "fallback-rotation"
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "account_ids": [],
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "cancel_event": asyncio.Event(),
+        }
+
+        async def select_proxy(target_job):
+            target_job.update({
+                "proxy": "http://127.0.0.1:7890",
+                "skip_oauth_rotation": False,
+                "proxy_rotation_controller_url": "http://127.0.0.1:9090",
+                "proxy_rotation_selector_name": "default-selector",
+            })
+            return target_job["proxy"]
+
+        accounts_api._OAUTH_JOBS[job_id] = job
+        try:
+            with (
+                patch.object(accounts_api.settings, "clash_rotate_enabled", True),
+                patch.object(accounts_api, "_select_oauth_proxy", side_effect=select_proxy),
+                patch.object(accounts_api, "_run_oauth_target_pool", new=AsyncMock(return_value=[])),
+                patch.object(
+                    accounts_api,
+                    "rotate_clash_proxy_for_round",
+                    new=AsyncMock(return_value={"ok": True, "before": "A", "after": "B", "ip": "203.0.113.10", "error": ""}),
+                ) as rotate,
+            ):
+                await accounts_api._run_codex_oauth_job(job_id, accounts_api.CodexOAuthJobBody(account_ids=[]))
+
+            rotate.assert_awaited_once()
+            self.assertEqual(rotate.await_args.kwargs["controller_url"], "http://127.0.0.1:9090")
+            self.assertEqual(rotate.await_args.kwargs["selector_name"], "default-selector")
+            self.assertEqual(rotate.await_args.kwargs["proxy"], "http://127.0.0.1:7890")
+        finally:
+            accounts_api._OAUTH_JOBS.pop(job_id, None)
 
     async def test_oauth_live_logs_capture_emit_log_for_frontend_polling(self):
         from app.api import accounts as accounts_api
@@ -205,6 +275,95 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rental["provider_id"], "12")
         self.assertEqual(rental["listed_price"], "0.014")
         self.assertEqual(attempts[0]["service"], "ot")
+
+    def test_smsbower_provider_candidates_keeps_all_nested_price_tiers_under_limit(self):
+        from app.api.accounts import _smsbower_provider_candidates
+
+        payload = {
+            "6": {
+                "ot": {
+                    "0.014": {"cheap": {"provider_id": "12", "price": "0.014", "count": "1"}},
+                    "0.021": {"standard": {"providerId": 15, "cost": "0.021", "available": 7}},
+                    "0.040": {"outside-limit": {"provider_id": "21", "price": "0.040", "count": 9}},
+                }
+            }
+        }
+
+        candidates = _smsbower_provider_candidates(payload, 6, "ot", 0.03)
+
+        self.assertEqual(
+            candidates,
+            [
+                {"provider_id": "12", "price": "0.014", "count": 1, "tier": "0.014/cheap"},
+                {"provider_id": "15", "price": "0.021", "count": 7, "tier": "0.021/standard"},
+            ],
+        )
+
+    async def test_rent_smsbower_number_tries_each_nested_price_tier(self):
+        from app.api import accounts as accounts_api
+
+        provider_calls = []
+
+        class FakeSms:
+            async def _get(self, action, **params):
+                if action == "getNumber":
+                    provider_calls.append(params.get("providerIds"))
+                    if params.get("providerIds") == "12":
+                        return "NO_NUMBERS"
+                    if params.get("providerIds") == "15":
+                        return "ACCESS_NUMBER:act_standard:628123456789"
+                    raise AssertionError(params)
+                raise AssertionError(action)
+
+            async def get_prices(self, service, country):
+                return '{"6":{"ot":{"tier-a":{"provider_id":"12","price":"0.014","count":"1"},"tier-b":{"provider_id":"15","price":"0.021","count":"3"}}}}'
+
+            async def set_status(self, activation_id, status):
+                return "ACCESS_READY"
+
+        attempts = []
+        with patch.object(accounts_api.settings, "smsbower_service", "ot"):
+            rental = await accounts_api._rent_smsbower_number(FakeSms(), ["ID"], 0.03, attempts, low_price_first=True)
+
+        self.assertEqual(provider_calls, ["12", "15"])
+        self.assertEqual(rental["activation_id"], "act_standard")
+        self.assertEqual(rental["listed_price"], "0.021")
+
+    async def test_rent_smsbower_number_covers_all_countries_and_price_tiers_before_generic_fallback(self):
+        from app.api import accounts as accounts_api
+
+        calls = []
+
+        class FakeSms:
+            async def _get(self, action, **params):
+                if action != "getNumber":
+                    raise AssertionError(action)
+                calls.append((params["country"], params.get("providerIds")))
+                if params.get("providerIds"):
+                    return "NO_NUMBERS"
+                return "ACCESS_NUMBER:act-generic:628123456789"
+
+            async def get_prices(self, service, country):
+                return json.dumps({
+                    str(country): {"ot": {
+                        "low": {"provider_id": f"{country}1", "price": "0.014", "count": "1"},
+                        "standard": {"provider_id": f"{country}2", "price": "0.021", "count": "1"},
+                    }},
+                })
+
+            async def set_status(self, activation_id, status):
+                return "ACCESS_READY"
+
+        attempts = []
+        with patch.object(accounts_api.settings, "smsbower_service", "ot"):
+            rental = await accounts_api._rent_smsbower_number(
+                FakeSms(), ["ID", "PH"], 0.03, attempts, low_price_first=True,
+            )
+
+        self.assertEqual(set(calls[:2]), {("6", "61"), ("4", "41")})
+        self.assertEqual(set(calls[2:4]), {("6", "62"), ("4", "42")})
+        self.assertEqual(set(calls[4:]), {("6", None), ("4", None)})
+        self.assertEqual(rental["activation_id"], "act-generic")
 
     async def test_rent_smsbower_number_falls_back_to_web_generic_endpoint(self):
         from app.api import accounts as accounts_api

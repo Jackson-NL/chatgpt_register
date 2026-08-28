@@ -581,7 +581,12 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(settings_call[1].endswith("/api/v1/admin/accounts/13549"))
         self.assertEqual(
             settings_call[3],
-            {"concurrency": 6, "load_factor": 6, "group_ids": [42]},
+            {
+                "concurrency": 6,
+                "load_factor": 6,
+                "group_ids": [42],
+                "name": "person@example.com||p@ssword||JBSWY3DPEHPK3PXP",
+            },
         )
         self.assertFalse(any(call[0] == "PATCH" for call in calls))
         self.assertEqual(result["results"][0]["has_access_token"], True)
@@ -686,7 +691,15 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }], "page_size": 100, "total": 1}})
             if method == "PUT":
-                self.assertEqual(json, {"concurrency": 8, "load_factor": 8, "group_ids": [7, 42, 108]})
+                self.assertEqual(
+                    json,
+                    {
+                        "concurrency": 8,
+                        "load_factor": 8,
+                        "group_ids": [7, 42, 108],
+                        "name": "person@example.com||p@ssword||JBSWY3DPEHPK3PXP",
+                    },
+                )
                 return FakeResponse(200, {"code": 0, "data": {"id": 13549}})
             return FakeResponse(200, {"code": 0, "data": {"id": 13549}})
 
@@ -762,7 +775,15 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(apply_call[3]["credentials"]["access_token"], "new-access-token")
         settings_calls = [call for call in calls if call[0] == "PUT" and call[1].endswith("/api/v1/admin/accounts/13549")]
         self.assertTrue(settings_calls, "apply-oauth-credentials 成功后也必须调用账号设置更新接口")
-        self.assertEqual(settings_calls[0][3], {"concurrency": 8, "load_factor": 8, "group_ids": [42]})
+        self.assertEqual(
+            settings_calls[0][3],
+            {
+                "concurrency": 8,
+                "load_factor": 8,
+                "group_ids": [42],
+                "name": "person@example.com||p@ssword||JBSWY3DPEHPK3PXP",
+            },
+        )
         self.assertFalse(any(call[0] == "PATCH" for call in calls), "Sub2API 没有 PATCH 路由，不允许发起 PATCH 请求")
 
     async def test_upload_created_account_applies_settings_update_after_create(self):

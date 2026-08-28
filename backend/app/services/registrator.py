@@ -41,7 +41,7 @@ from .browser_stack import (
     human_scroll,
 )
 from .cf_layer import solve_turnstile, combined_judgment, detect_turnstile
-from .console_logging import safe_console_print
+from .console_logging import enqueue_console_print
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -55,9 +55,11 @@ _LOG_SEQ = 0
 _LOG_SOURCE: "contextvars.ContextVar[str]" = contextvars.ContextVar("log_source", default="oauth")
 _OAUTH_LOG_LIMIT = 20000
 _OAUTH_LOG_BUFFER = deque(maxlen=_OAUTH_LOG_LIMIT)
+_OAUTH_LOG_DB_HYDRATED = False
 # 单次响应体积安全上限：切换页面/长时间未轮询后回看时，after 之后的日志应完整返回，
 # 不能被截断成「最近 N 条」，否则会丢历史。这里只防极端一次返回过多，正常轮询每次仅增量。
 _OAUTH_LOG_RESPONSE_CAP = 10000
+_OAUTH_TOKEN_EXCHANGE_LOCK = asyncio.Lock()
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_.\-]{20,}")
 # base32 TOTP secret：大小写均覆盖（A-Za-z2-7，16-128 位）；不含 0/1/6/8/9，
 # 因此不会误伤 32 位 hex 的 session_id / factor id。
@@ -129,6 +131,31 @@ def get_oauth_logs(after: int = 0, limit: int = 300) -> dict:
     after 之后的日志完整返回（不再截断成「最近 N 条」），这样切换页面/长时间未轮询
     后回看能通过游标一次性补齐历史，不会丢日志。limit 仅作单次响应体积的安全上限。
     """
+    global _LOG_SEQ, _OAUTH_LOG_DB_HYDRATED
+    # Uvicorn restarts clear the live deque while OAuth logs remain persisted.
+    # Hydrate once so an active/recovered OAuth page does not appear blank.
+    if not _OAUTH_LOG_DB_HYDRATED:
+        _OAUTH_LOG_DB_HYDRATED = True
+        try:
+            from ..db import SessionLocal
+            from ..models import OAuthLog
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(OAuthLog)
+                    .order_by(OAuthLog.seq.desc())
+                    .limit(_OAUTH_LOG_LIMIT)
+                    .all()
+                )
+                for row in reversed(rows):
+                    _OAUTH_LOG_BUFFER.append({"seq": int(row.seq), "ts": row.ts, "msg": row.msg})
+                if rows:
+                    _LOG_SEQ = max(_LOG_SEQ, int(rows[0].seq))
+            finally:
+                db.close()
+        except Exception:
+            # Persistence is best effort; live logging must remain available.
+            pass
     safe_after = max(0, int(after or 0))
     items = [line for line in list(_OAUTH_LOG_BUFFER) if int(line.get("seq", 0)) > safe_after]
     latest_seq = int(_OAUTH_LOG_BUFFER[-1]["seq"]) if _OAUTH_LOG_BUFFER else _LOG_SEQ
@@ -143,7 +170,9 @@ def get_oauth_logs(after: int = 0, limit: int = 300) -> dict:
 
 def clear_oauth_logs() -> None:
     """清空 OAuth 全局日志缓冲；测试和手动清理使用。"""
+    global _OAUTH_LOG_DB_HYDRATED
     _OAUTH_LOG_BUFFER.clear()
+    _OAUTH_LOG_DB_HYDRATED = True
 
 
 def _persist_oauth_log(seq: int, ts: str, msg: str) -> None:
@@ -189,7 +218,6 @@ def emit_log(msg: str, flush: bool = True) -> None:
     """
     global _LOG_SEQ
     safe_msg = redact_sensitive(msg) if _REDACT_ENABLED else str(msg)
-    safe_console_print(safe_msg, flush=flush)
     _LOG_SEQ += 1
     ts = time.strftime("%H:%M:%S")
     line = {"seq": _LOG_SEQ, "ts": ts, "msg": safe_msg}
@@ -198,10 +226,17 @@ def emit_log(msg: str, flush: bool = True) -> None:
             for _, lines in _LOG_SINKS:
                 lines.append(line)
     else:
-        # Publish to the live buffer first. Database persistence is diagnostic
-        # only and must not block the OAuth event loop or hide the first log.
+        # Publish to the live buffer before any console I/O.  On Windows the
+        # backend may be restarted with stdout attached to a pipe that no
+        # longer drains; synchronous flush would otherwise freeze the OAuth
+        # background task before the UI can show the first backend log.
         _OAUTH_LOG_BUFFER.append(line)
         _schedule_oauth_log_persistence(line["seq"], line["ts"], line["msg"])
+    try:
+        enqueue_console_print(safe_msg, flush=flush)
+    except Exception:
+        # Console output is diagnostic only; live OAuth logs already reached the UI buffer.
+        pass
 
 
 def set_log_source(source: str) -> "contextvars.Token":
@@ -671,6 +706,14 @@ _OPENAI_RISK_MARKERS = (
 )
 
 
+_PHONE_ALREADY_USED_MARKERS = (
+    "phone number already in use",
+    "phone number is already in use",
+    "手机号已被使用",
+    "手机号已经被使用",
+)
+
+
 def _is_openai_risk(text: str) -> bool:
     """OpenAI rejects the current authorization state and requires a new phone attempt."""
     lowered = str(text or "").lower()
@@ -684,6 +727,12 @@ def _is_provider_unavailable(text: str) -> bool:
     """
     lowered = str(text or "").lower()
     return any(marker in lowered for marker in _PROVIDER_UNAVAILABLE_MARKERS)
+
+
+def _is_phone_already_used(text: str) -> bool:
+    """OpenAI says the submitted phone is already attached to another account."""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _PHONE_ALREADY_USED_MARKERS)
 
 
 def _format_phone_log_context(
@@ -873,6 +922,7 @@ async def fetch_authorize(
 
 
 async def exchange_code(code: str, verifier: str, redirect_uri: str, proxy: str = "") -> dict:
+    """Exchange one PKCE callback code without competing for the proxy tunnel."""
     data = {
         "grant_type": "authorization_code",
         "client_id": OAUTH_CLIENT_ID,
@@ -880,14 +930,56 @@ async def exchange_code(code: str, verifier: str, redirect_uri: str, proxy: str 
         "redirect_uri": redirect_uri,
         "code_verifier": verifier,
     }
-    async with httpx.AsyncClient(
-        proxy=proxy or None,
-        trust_env=not bool(proxy),
-        timeout=30,
-    ) as client:
-        response = await client.post(OAUTH_TOKEN_URL, data=data)
-        response.raise_for_status()
-        return response.json()
+    started = time.monotonic()
+    async with _OAUTH_TOKEN_EXCHANGE_LOCK:
+        waited = time.monotonic() - started
+        emit_log(
+            f"[stage:oauth] 开始令牌交换 proxy={proxy or 'direct'} queue_wait={waited:.1f}s",
+            flush=True,
+        )
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(
+                    proxy=proxy or None,
+                    trust_env=not bool(proxy),
+                    timeout=httpx.Timeout(60.0, connect=15.0),
+                ) as client:
+                    response = await client.post(OAUTH_TOKEN_URL, data=data)
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.HTTPStatusError as error:
+                body = error.response.text[:300].replace("\n", " ")
+                raise RegisterError(
+                    "oauth",
+                    f"令牌交换 HTTP {error.response.status_code}: {body or '<empty response>'}",
+                ) from error
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ProxyError) as error:
+                cause = error.__cause__ or error.__context__
+                detail = str(error) or repr(cause) or "<empty>"
+                if attempt < max_attempts:
+                    delay = float(attempt)
+                    emit_log(
+                        f"[stage:oauth] 令牌交换瞬态网络失败 type={type(error).__name__} "
+                        f"attempt={attempt}/{max_attempts} detail={detail[:180]}，{delay:.0f}s 后重试",
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                kind = "超时" if isinstance(error, httpx.TimeoutException) else "网络失败"
+                raise RegisterError(
+                    "oauth",
+                    f"令牌交换{kind} type={type(error).__name__} detail={detail[:300]} "
+                    f"attempts={attempt} elapsed={time.monotonic() - started:.1f}s proxy={proxy or 'direct'}",
+                ) from error
+            except httpx.HTTPError as error:
+                cause = error.__cause__ or error.__context__
+                detail = str(error) or repr(cause) or "<empty>"
+                raise RegisterError(
+                    "oauth",
+                    f"令牌交换网络失败 type={type(error).__name__} detail={detail[:300]} "
+                    f"elapsed={time.monotonic() - started:.1f}s proxy={proxy or 'direct'}",
+                ) from error
 
 
 def parse_id_token(id_token: str) -> dict:
@@ -1867,6 +1959,8 @@ class Registrator:
         try:
             token_data = await exchange_code(code, pkce["verifier"], redirect_uri, proxy)
             identity = parse_id_token(token_data.get("id_token", ""))
+        except RegisterError:
+            raise
         except Exception as error:
             raise RegisterError("oauth", f"令牌交换失败: {str(error)[:200]}") from error
         return self._oauth_token_result(
@@ -1989,7 +2083,7 @@ class Registrator:
                     flush=True,
                 )
                 last_progress = now
-            clicked = await self._click_oauth_action(page)
+            clicked = await self._click_oauth_action(page, account_email=email)
             if clicked:
                 await page.wait_for_timeout(900)
             capture(page.url)
@@ -2102,17 +2196,41 @@ class Registrator:
             f"[stage:oauth] 检测到 profile 登录态失效，开始自动恢复登录 email={email}",
             flush=True,
         )
+        mail_client = None
+        inbox_jwt = str(settings.cf_temp_email_inbox_jwt or "")
+        after_mail_id = 0
+        email_code_submitted = False
+        try:
+            if inbox_jwt:
+                from .tempmail import TempmailClient
+
+                mail_client = TempmailClient()
+                mails = await mail_client.list_parsed_mails(inbox_jwt, limit=1)
+                after_mail_id = max(
+                    (int(item.get("id")) for item in mails if str(item.get("id", "")).isdigit()),
+                    default=0,
+                )
+        except Exception as error:  # noqa: BLE001
+            emit_log(f"[stage:oauth] 固定收件箱初始化失败: {str(error)[:120]}", flush=True)
+            mail_client = None
         deadline = asyncio.get_event_loop().time() + max(15.0, float(timeout_s or 90.0))
         email_submitted = False
         password_submitted = False
         totp_submitted = False
+        totp_submitted_at = 0.0
         last_action = 0.0
         last_terminal_check = 0.0
 
         while asyncio.get_event_loop().time() < deadline:
             current_url = str(getattr(page, "url", "") or "")
             lowered_url = current_url.lower()
-            if "auth.openai.com/log-in" not in lowered_url and "auth.openai.com/login" not in lowered_url:
+            recovery_url = (
+                "auth.openai.com/log-in" in lowered_url
+                or "auth.openai.com/login" in lowered_url
+                or "auth.openai.com/email-verification" in lowered_url
+                or "auth.openai.com/mfa-challenge" in lowered_url
+            )
+            if not recovery_url:
                 emit_log(f"[stage:oauth] profile 登录态恢复完成 url={current_url[:140]}", flush=True)
                 return True
 
@@ -2126,6 +2244,70 @@ class Registrator:
                         "OAuth 登录被拒绝：账号已停用/封禁（account_deactivated）无法重授权，"
                         f"signal={terminal_signal} url={current_url[:140]} email={email}",
                     )
+
+            # Login recovery may require a fresh email OTP before TOTP. Use
+            # the fixed Duck inbox and only accept mail newer than the cursor
+            # captured before this OAuth attempt.
+            try:
+                code_input = page.locator(", ".join(CODE_INPUT_SELECTORS)).first
+                code_visible = bool(await code_input.count() and await code_input.is_visible())
+            except Exception:
+                code_visible = False
+            if code_visible:
+                try:
+                    body = await page.locator("body").inner_text(timeout=1200)
+                except Exception:
+                    body = ""
+                signal = f"{lowered_url} {body}".lower()
+                email_verification = "email-verification" in lowered_url or any(
+                    marker in signal for marker in ("check your inbox", "verification code")
+                )
+                if email_verification:
+                    if email_code_submitted:
+                        await asyncio.sleep(0.4)
+                        continue
+                    if not mail_client or not inbox_jwt:
+                        raise RegisterError("oauth", "OAuth 登录需要邮箱验证码，但未配置固定收件箱")
+                    remaining = max(10.0, deadline - asyncio.get_event_loop().time())
+                    try:
+                        code = await mail_client.wait_for_code(
+                            inbox_jwt,
+                            timeout=min(remaining, 120.0),
+                            after_mail_id=after_mail_id,
+                            recipient=email,
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        raise RegisterError("oauth", f"OAuth 邮箱验证码获取失败: {str(error)[:180]}") from error
+                    if not await find_and_fill(page, CODE_INPUT_SELECTORS, code):
+                        raise RegisterError("oauth", "OAuth 邮箱验证码输入框不可用")
+                    clicked = await find_and_click(page, OAUTH_LOGIN_BUTTON_TEXT)
+                    if not clicked:
+                        clicked = await click_locator(page.locator('button[type="submit"]').first)
+                    if not clicked:
+                        raise RegisterError("oauth", "OAuth 邮箱验证码提交按钮不可用")
+                    email_code_submitted = True
+                    await page.wait_for_timeout(700)
+                    continue
+
+            if "mfa-challenge" in lowered_url and not totp_secret:
+                raise RegisterError("oauth", "OAuth 登录需要有效 TOTP，但账号没有保存 totp_secret")
+            if totp_submitted:
+                try:
+                    body = await page.locator("body").inner_text(timeout=1000)
+                except Exception:
+                    body = ""
+                if re.search(r"incorrect|invalid|wrong|不正确|无效", body, re.IGNORECASE):
+                    raise RegisterError("oauth", "OAuth 登录保存的 TOTP 无效，无法继续")
+                # Do not leave a failed MFA attempt spinning until the full
+                # OAuth timeout. A valid code should leave mfa-challenge
+                # promptly; a stale secret commonly leaves the same page
+                # without a durable error message.
+                if (
+                    "mfa-challenge" in lowered_url
+                    and totp_submitted_at
+                    and asyncio.get_event_loop().time() - totp_submitted_at >= 8.0
+                ):
+                    raise RegisterError("oauth", "OAuth 登录 TOTP 未通过，页面仍停留在 MFA challenge")
 
 
             if not email_submitted and await find_and_fill(page, OAUTH_LOGIN_EMAIL_SELECTORS, email):
@@ -2154,6 +2336,7 @@ class Registrator:
 
             if not totp_submitted and totp_secret and await self._fill_oauth_totp(page, totp_secret):
                 totp_submitted = True
+                totp_submitted_at = asyncio.get_event_loop().time()
                 await page.wait_for_timeout(250)
                 clicked = await find_and_click(page, OAUTH_LOGIN_BUTTON_TEXT)
                 if not clicked:
@@ -2189,13 +2372,50 @@ class Registrator:
             raise RegisterError("oauth", f"OAuth 登录 TOTP secret 无效: {str(error)[:120]}") from error
         return await find_and_fill(page, CODE_INPUT_SELECTORS, code)
 
-    async def _click_oauth_action(self, page) -> bool:
+    async def _click_oauth_action(self, page, account_email: str = "") -> bool:
         """OAuth 中间页动作：选择已登录账号 / 继续授权 / 允许。
 
         注意：add-phone 页不能通用点 Continue；必须先由手机号流程填表。
         """
         if "add-phone" in str(getattr(page, "url", "")):
             return False
+        normalized_email = str(account_email or "").strip()
+        if normalized_email and "choose-an-account" in str(getattr(page, "url", "")):
+            try:
+                account_button = page.get_by_role(
+                    "button",
+                    name=re.compile(re.escape(normalized_email), re.IGNORECASE),
+                ).first
+                if await click_locator(account_button, timeout_ms=3000):
+                    emit_log(f"[stage:oauth] 已选择 OAuth 账号: {normalized_email}", flush=True)
+                    return True
+            except Exception:
+                pass
+            try:
+                clicked_label = await page.evaluate(
+                    r"""
+                    email => {
+                      const needle = String(email || '').trim().toLowerCase();
+                      const targets = Array.from(document.querySelectorAll('button, [role="button"]'));
+                      const target = targets.find(el => {
+                        const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        return !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+                          && text.includes(needle) && /select account/i.test(text);
+                      });
+                      if (!target) return '';
+                      target.scrollIntoView({ block: 'center', inline: 'center' });
+                      target.focus();
+                      target.click();
+                      return (target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+                    }
+                    """,
+                    normalized_email,
+                )
+                if clicked_label:
+                    emit_log(f"[stage:oauth] JS 已选择 OAuth 账号: {normalized_email}", flush=True)
+                    return True
+            except Exception:
+                pass
         texts = [
             "Select account",
             "Continue",
@@ -2978,6 +3198,13 @@ class Registrator:
                 break
         if last_errors:
             error_text = " | ".join(last_errors)
+            if _is_phone_already_used(error_text):
+                await self._cancel_phone_order(activation_id)
+                emit_log(
+                    "[stage:oauth] 手机号已被 OpenAI 使用，跳过截图和验证码轮询，直接换号",
+                    flush=True,
+                )
+                raise RegisterError("oauth", "手机号已被使用，需要换号: " + " | ".join(last_errors[:3]))
             if _is_openai_risk(error_text):
                 emit_log(
                     "[stage:oauth] OpenAI 风控：授权步骤无效，跳过截图和验证码轮询，直接换号",
@@ -2993,55 +3220,15 @@ class Registrator:
                 await self._cancel_phone_order(activation_id)
                 emit_log("[stage:oauth] WhatsApp fallback 号码已取消，准备重新获取手机号", flush=True)
                 raise RegisterError("oauth", "短信通道不可用，需要换号: " + " | ".join(last_errors[:3]))
+            # Any other add-phone page error is treated as phone risk.  Do not
+            # create diagnostics or wait for a code: cancel and let the outer
+            # OAuth loop immediately switch to the next number.
+            await self._cancel_phone_order(activation_id)
             emit_log(
-                "[stage:oauth] add-phone 页面报错/切换 WhatsApp；短信可能已触发，先短轮询验证码再决定是否取消",
+                "[stage:oauth] add-phone 页面异常，判定为手机号风控；跳过截图和短信轮询，立即换号",
                 flush=True,
             )
-            screenshot_path = await self._capture_oauth_debug(
-                page,
-                "phone_submit_page_error",
-            )
-            emit_log(
-                f"[stage:oauth] 已保存 add-phone/WhatsApp 错误现场截图: {screenshot_path or '失败'}",
-                flush=True,
-            )
-            if not self.sms:
-                raise RegisterError("oauth", "缺少 SMS 客户端，无法轮询手机号验证码")
-            grace_deadline = asyncio.get_event_loop().time() + min(OAUTH_SMS_ERROR_GRACE_SECONDS, max(float(sms_poll_timeout), 0.0))
-            grace_polls = 0
-            grace_started = asyncio.get_event_loop().time()
-            grace_last_progress = grace_started
-            while asyncio.get_event_loop().time() < grace_deadline:
-                grace_polls += 1
-                now = asyncio.get_event_loop().time()
-                try:
-                    status, code = await self.sms.get_status(activation_id)
-                except Exception as error:  # noqa: BLE001
-                    emit_log(
-                        f"[stage:oauth] SMS API 轮询失败，继续重试 source=page_error_grace "
-                        f"activation_id={activation_id} polls={grace_polls} error={str(error)[:160]}",
-                        flush=True,
-                    )
-                    await asyncio.sleep(sms_poll_interval)
-                    continue
-                if status == "code":
-                    last_errors = []
-                    otp_code = code
-                    emit_log(
-                        f"[stage:oauth] [PHONE_CODE_RECEIVED] 手机验证码已收到 source=page_error_grace "
-                        f"code={otp_code} {phone_context} polls={grace_polls}，继续提交验证码",
-                        flush=True,
-                    )
-                    break
-                if status != "wait":
-                    break
-                if now - grace_last_progress >= 8:
-                    emit_log(
-                        f"[stage:oauth] 页面报错后继续等待短信 elapsed={now - grace_started:.0f}s polls={grace_polls} status={status}",
-                        flush=True,
-                    )
-                    grace_last_progress = now
-                await asyncio.sleep(sms_poll_interval)
+            raise RegisterError("oauth", "手机号风控，需要换号: " + " | ".join(last_errors[:3]))
         else:
             otp_code = ""
 
@@ -3066,6 +3253,13 @@ class Registrator:
             page_errors_now = await self._oauth_phone_errors(page)
             if page_errors_now:
                 error_text = " | ".join(page_errors_now)
+                if _is_phone_already_used(error_text):
+                    await self._cancel_phone_order(activation_id)
+                    emit_log(
+                        "[stage:oauth] 等码期间发现手机号已被 OpenAI 使用，跳过截图和验证码轮询，直接换号",
+                        flush=True,
+                    )
+                    raise RegisterError("oauth", "手机号已被使用，需要换号: " + " | ".join(page_errors_now[:3]))
                 if _is_openai_risk(error_text):
                     emit_log(
                         "[stage:oauth] OpenAI 风控：授权步骤无效，跳过截图和验证码轮询，直接换号",
@@ -3081,42 +3275,12 @@ class Registrator:
                     await self._cancel_phone_order(activation_id)
                     emit_log("[stage:oauth] WhatsApp fallback 号码已取消，准备重新获取手机号", flush=True)
                     raise RegisterError("oauth", "短信通道不可用，需要换号: " + " | ".join(page_errors_now[:3]))
+                await self._cancel_phone_order(activation_id)
                 emit_log(
-                    "[stage:oauth] 等码期间页面报错/切换 WhatsApp；先短轮询验证码再决定是否取消",
+                    "[stage:oauth] 等码期间页面异常，判定为手机号风控；跳过截图和短信轮询，立即换号",
                     flush=True,
                 )
-                screenshot_path = await self._capture_oauth_debug(
-                    page,
-                    "phone_poll_page_error",
-                )
-                emit_log(
-                    f"[stage:oauth] 已保存等码期间 add-phone/WhatsApp 错误现场截图: {screenshot_path or '失败'}",
-                    flush=True,
-                )
-                grace_deadline = asyncio.get_event_loop().time() + min(OAUTH_SMS_ERROR_GRACE_SECONDS, max(deadline - now, 0.0))
-                grace_started = now
-                grace_last_progress = now
-                while asyncio.get_event_loop().time() < grace_deadline:
-                    status, code = await self.sms.get_status(activation_id)
-                    poll_count += 1
-                    now = asyncio.get_event_loop().time()
-                    if status == "code":
-                        otp_code = code
-                        emit_log(
-                            f"[stage:oauth] [PHONE_CODE_RECEIVED] 手机验证码已收到 source=page_error_poll "
-                            f"code={otp_code} {phone_context} polls={poll_count}，继续提交验证码",
-                            flush=True,
-                        )
-                        break
-                    if status != "wait":
-                        break
-                    if now - grace_last_progress >= 8:
-                        emit_log(
-                            f"[stage:oauth] 页面报错后继续等待短信 elapsed={now - grace_started:.0f}s polls={poll_count} status={status}",
-                            flush=True,
-                        )
-                        grace_last_progress = now
-                    await asyncio.sleep(sms_poll_interval)
+                raise RegisterError("oauth", "手机号风控，需要换号: " + " | ".join(page_errors_now[:3]))
                 if otp_code:
                     break
                 await self._cancel_phone_order(activation_id)
@@ -3514,6 +3678,21 @@ class Registrator:
                                 last_url = cur_url
                                 url_stuck_since = now
                             elif now - url_stuck_since >= stuck_after:
+                                if phone_submitted and successful_rental:
+                                    stuck_rental = successful_rental
+                                    stuck_activation_id = str(stuck_rental.get("activation_id") or "")
+                                    await self._cancel_phone_order(stuck_activation_id)
+                                    emit_log(
+                                        "[stage:oauth] 手机号提交后页面卡住，判定为手机号风控；跳过截图，立即换号",
+                                        flush=True,
+                                    )
+                                    phone_submitted = False
+                                    successful_rental = None
+                                    last_phone_error = "手机号风控：提交后页面卡住"
+                                    await self._reset_oauth_add_phone_for_retry(page)
+                                    last_url = str(getattr(page, "url", ""))
+                                    url_stuck_since = now
+                                    continue
                                 if not phone_submitted and ("log-in" in cur_url or "login" in cur_url):
                                     raise RegisterError(
                                         "oauth",
@@ -3595,6 +3774,13 @@ class Registrator:
                                         last_phone_error = "手机号风控：OpenAI 无法给该号发短信(切换 WhatsApp)"
                                         emit_log(
                                             "[stage:oauth] 手机号风控：OpenAI 无法给该号发短信(切换 WhatsApp)，继续换号",
+                                            flush=True,
+                                        )
+                                    elif _is_phone_already_used(last_phone_error):
+                                        risk_label = "手机号已被使用"
+                                        last_phone_error = "手机号已被使用，需要换号"
+                                        emit_log(
+                                            "[stage:oauth] 手机号已被 OpenAI 使用，当前号码取消后继续换号",
                                             flush=True,
                                         )
                                     emit_log(
@@ -3679,6 +3865,8 @@ class Registrator:
         try:
             token_data = await exchange_code(code, pkce["verifier"], redirect_uri, proxy)
             identity = parse_id_token(token_data.get("id_token", ""))
+        except RegisterError:
+            raise
         except Exception as error:
             raise RegisterError("oauth", f"令牌交换失败: {str(error)[:200]}") from error
         emit_log(
@@ -3746,6 +3934,8 @@ class Registrator:
         try:
             token_data = await exchange_code(code, pkce["verifier"], redirect_uri, proxy)
             identity = parse_id_token(token_data.get("id_token", ""))
+        except RegisterError:
+            raise
         except Exception as error:
             raise RegisterError("oauth", f"令牌交换失败: {str(error)[:200]}") from error
 

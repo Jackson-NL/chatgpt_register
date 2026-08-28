@@ -186,8 +186,14 @@ class TempmailClient:
         timeout: float | None = None,
         poll_interval: float | None = None,
         after_mail_id: int | None = None,
+        recipient: str | None = None,
     ) -> str:
-        """轮询收件箱直到拿到验证码；429/网络错误自动退避重试。"""
+        """轮询收件箱直到拿到验证码；429/网络错误自动退避重试。
+
+        recipient：当多个账号共用一个固定收件箱时，按邮件 sender 中的真实收件人
+        （如 noreply_at_tm.openai.com_<local>@duck.com 含 <local>@duck.com）精确匹配，
+        避免并发时验证码串线。
+        """
         timeout = timeout if timeout is not None else settings.cf_temp_email_poll_timeout
         poll_interval = poll_interval if poll_interval is not None else self.poll_interval
         loop = asyncio.get_running_loop()
@@ -199,6 +205,10 @@ class TempmailClient:
                     if after_mail_id is not None:
                         raw_id = mail.get("id")
                         if str(raw_id).isdigit() and int(raw_id) <= int(after_mail_id):
+                            continue
+                    if recipient is not None:
+                        hay = " ".join(str(mail.get(k, "") or "") for k in ("sender", "source", "address", "subject", "text", "html"))
+                        if recipient not in hay:
                             continue
                     text = " ".join(str(mail.get(k, "") or "") for k in ("html", "text", "subject"))
                     code = _extract_code(text)

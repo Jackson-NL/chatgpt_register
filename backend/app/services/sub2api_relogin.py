@@ -24,10 +24,8 @@ from .browser_stack import build_launch_options
 from .registrator import (
     AsyncCamoufox,
     CODE_INPUT_SELECTORS,
-    OAUTH_REDIRECT_URI,
     PASSWORD_INPUT_SELECTORS,
     SUBMIT_BUTTON_TEXT,
-    OAuthCallbackListener,
     RegisterError,
     Registrator,
     find_and_click,
@@ -41,7 +39,6 @@ from .sub2api import Sub2APIClient, Sub2APIError, is_sub2api_error_account
 
 MAX_LOG_LINES = 1000
 _JOBS: dict[int, asyncio.Task] = {}
-_CALLBACK_LOCK = asyncio.Lock()
 _TERMINAL_REMOTE_RE = re.compile(r"deleted|deactivated|suspended|已删除|停用|封禁", re.IGNORECASE)
 _PHONE_RE = re.compile(r"add[- ]?phone|phone[- ]?verification|phone number required|verify your phone|手机验证|手机号码验证", re.IGNORECASE)
 _EMAIL_SELECTORS = [
@@ -191,11 +188,15 @@ def _extract_state(auth_url: str) -> str:
 
 
 def _callback_details(raw_url: str, expected_state: str) -> dict[str, str] | None:
+    """Extract a code from the remote redirect observed by the browser.
+
+    The redirect endpoint belongs to Sub2API, so it must not be constrained to
+    the former localhost callback. State remains mandatory and binds the code
+    to the reauthorization session created for this account.
+    """
     try:
         parsed = urllib.parse.urlparse(str(raw_url or ""))
     except ValueError:
-        return None
-    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or parsed.path != "/auth/callback":
         return None
     query = urllib.parse.parse_qs(parsed.query)
     code = str(query.get("code", [""])[0] or "").strip()
@@ -203,6 +204,19 @@ def _callback_details(raw_url: str, expected_state: str) -> dict[str, str] | Non
     if not code or not state or state != expected_state:
         return None
     return {"callback_url": str(raw_url), "code": code, "state": state}
+
+
+def _remote_reauth_redirect_uri() -> str:
+    """Return the registered Sub2API callback used for browser-only capture."""
+    value = str(settings.sub2api_reauth_redirect_uri or settings.sub2api_base_url or "").strip().rstrip("/")
+    if not value:
+        raise RegisterError("sub2api-relogin", "未配置 Sub2API 远端 OAuth 回调地址")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RegisterError("sub2api-relogin", "Sub2API 远端 OAuth 回调地址无效")
+    if not str(settings.sub2api_reauth_redirect_uri or "").strip():
+        return f"{value}/auth/callback"
+    return value
 
 
 async def _fill_totp_code(page, code: str) -> bool:
@@ -379,89 +393,77 @@ async def capture_oauth_callback_from_profile(
         if details and not captured:
             captured.update(details)
 
-    # redirect_uri 固定为项目已有 listener 监听的 1455 端口，避免与 Sub2API
-    # 生成的授权链接不一致。多个任务的浏览器阶段在此锁内串行，远端准备和任务
-    # 计数仍然按 concurrency 并发执行。
-    async with _CALLBACK_LOCK:
-        try:
-            async with OAuthCallbackListener(OAUTH_REDIRECT_URI, expected_state) as listener:
-                async with AsyncCamoufox(**launch_options) as browser:
-                    context = browser if launch_options.get("persistent_context") else await browser.new_context(locale="en-US")
-                    page = context.pages[0] if context.pages else await context.new_page()
-                    page.on("response", lambda response: capture(response.url))
-                    page.on("request", lambda request: capture(request.url))
-                    page.on("framenavigated", lambda frame: capture(frame.url) if frame == page.main_frame else None)
-                    await page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
-                    await wait_spa_ready(page, pause_ms=500)
+    try:
+        async with AsyncCamoufox(**launch_options) as browser:
+            context = browser if launch_options.get("persistent_context") else await browser.new_context(locale="en-US")
+            page = context.pages[0] if context.pages else await context.new_page()
+            page.on("response", lambda response: capture(response.url))
+            page.on("request", lambda request: capture(request.url))
+            page.on("framenavigated", lambda frame: capture(frame.url) if frame == page.main_frame else None)
+            await page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+            await wait_spa_ready(page, pause_ms=500)
 
-                    deadline = asyncio.get_running_loop().time() + max(10, int(timeout_s or 160))
-                    email_submitted = False
-                    password_submitted = False
-                    totp_submitted = False
-                    last_action = 0.0
-                    while not captured and asyncio.get_running_loop().time() < deadline:
-                        capture(str(getattr(page, "url", "")))
-                        if captured:
-                            break
-                        url = str(getattr(page, "url", ""))
-                        try:
-                            body_text = str(await page.evaluate("document.body?.innerText || ''"))[:1800]
-                        except Exception:
-                            body_text = ""
-                        signal = f"{url} {body_text}"
-                        if _PHONE_RE.search(signal):
-                            raise Sub2APIReloginSkipped("phone_second_verification")
-                        if _TERMINAL_REMOTE_RE.search(signal):
-                            raise Sub2APIReloginSkipped("deactivated")
+            deadline = asyncio.get_running_loop().time() + max(10, int(timeout_s or 160))
+            email_submitted = False
+            password_submitted = False
+            totp_submitted = False
+            last_action = 0.0
+            while not captured and asyncio.get_running_loop().time() < deadline:
+                capture(str(getattr(page, "url", "")))
+                if captured:
+                    break
+                url = str(getattr(page, "url", ""))
+                try:
+                    body_text = str(await page.evaluate("document.body?.innerText || ''"))[:1800]
+                except Exception:
+                    body_text = ""
+                signal = f"{url} {body_text}"
+                if _PHONE_RE.search(signal):
+                    raise Sub2APIReloginSkipped("phone_second_verification")
+                if _TERMINAL_REMOTE_RE.search(signal):
+                    raise Sub2APIReloginSkipped("deactivated")
 
-                        if not email_submitted:
-                            if await find_and_fill(page, _EMAIL_SELECTORS, email):
-                                email_submitted = True
-                                await page.wait_for_timeout(250)
-                                await find_and_click(page, _AUTH_BUTTONS)
-                                await page.wait_for_timeout(700)
-                                continue
+                if not email_submitted:
+                    if await find_and_fill(page, _EMAIL_SELECTORS, email):
+                        email_submitted = True
+                        await page.wait_for_timeout(250)
+                        await find_and_click(page, _AUTH_BUTTONS)
+                        await page.wait_for_timeout(700)
+                        continue
 
-                        if not password_submitted:
-                            if await find_and_fill(page, PASSWORD_INPUT_SELECTORS, password):
-                                password_submitted = True
-                                await page.wait_for_timeout(250)
-                                await find_and_click(page, _AUTH_BUTTONS)
-                                await page.wait_for_timeout(700)
-                                continue
+                if not password_submitted:
+                    if await find_and_fill(page, PASSWORD_INPUT_SELECTORS, password):
+                        password_submitted = True
+                        await page.wait_for_timeout(250)
+                        await find_and_click(page, _AUTH_BUTTONS)
+                        await page.wait_for_timeout(700)
+                        continue
 
-                        if not totp_submitted:
-                            try:
-                                totp_code = pyotp.TOTP(totp_secret).now()
-                            except Exception as error:
-                                raise RegisterError("sub2api-relogin", "TOTP secret 无效") from error
-                            if await _fill_totp_code(page, totp_code):
-                                totp_submitted = True
-                                await page.wait_for_timeout(250)
-                                await find_and_click(page, _AUTH_BUTTONS)
-                                await page.wait_for_timeout(700)
-                                continue
+                if not totp_submitted:
+                    try:
+                        totp_code = pyotp.TOTP(totp_secret).now()
+                    except Exception as error:
+                        raise RegisterError("sub2api-relogin", "TOTP secret 无效") from error
+                    if await _fill_totp_code(page, totp_code):
+                        totp_submitted = True
+                        await page.wait_for_timeout(250)
+                        await find_and_click(page, _AUTH_BUTTONS)
+                        await page.wait_for_timeout(700)
+                        continue
 
-                        now = asyncio.get_running_loop().time()
-                        if now - last_action >= 2:
-                            if await registrator._click_oauth_action(page):
-                                last_action = now
-                                await page.wait_for_timeout(700)
-                                continue
-                        await asyncio.sleep(0.4)
-
-                    if not captured:
-                        try:
-                            callback = await listener.wait_callback(min(10, max(1, int(timeout_s or 160))))
-                            captured.update(callback)
-                        except (TimeoutError, asyncio.TimeoutError) as error:
-                            raise RegisterError("sub2api-relogin", "未捕获 OAuth callback") from error
-        except Sub2APIReloginSkipped:
-            raise
-        except RegisterError:
-            raise
-        except Exception as error:  # noqa: BLE001
-            raise RegisterError("sub2api-relogin", _safe_error(error)) from error
+                now = asyncio.get_running_loop().time()
+                if now - last_action >= 2:
+                    if await registrator._click_oauth_action(page):
+                        last_action = now
+                        await page.wait_for_timeout(700)
+                        continue
+                await asyncio.sleep(0.4)
+    except Sub2APIReloginSkipped:
+        raise
+    except RegisterError:
+        raise
+    except Exception as error:  # noqa: BLE001
+        raise RegisterError("sub2api-relogin", _safe_error(error)) from error
 
     if not captured:
         raise RegisterError("sub2api-relogin", "未捕获 OAuth callback")
@@ -712,7 +714,7 @@ class Sub2APIReloginService:
             work_profile_path = ""
             try:
                 await self._append_log(job_id, f"账号 #{remote_id} 开始重登（第 {attempt}/{attempts} 次）")
-                auth = await client.request_reauth_url(remote_id, OAUTH_REDIRECT_URI)
+                auth = await client.request_reauth_url(remote_id, _remote_reauth_redirect_uri())
                 await self._set_reauth_endpoint(item_id, auth.get("endpoint", ""))
                 expected_state = str(auth.get("state") or "").strip() or _extract_state(str(auth.get("auth_url") or ""))
                 auth_url_state = _extract_state(str(auth.get("auth_url") or ""))
@@ -743,6 +745,16 @@ class Sub2APIReloginService:
                 await client.set_schedulable(remote_id, True)
                 _commit_relogin_profile_copy(work_profile_path, local.profile_path)
                 work_profile_path = ""
+                db_update = SessionLocal()
+                try:
+                    refreshed = db_update.get(Account, local.id)
+                    if refreshed:
+                        refreshed.profile_last_used_at = utcnow()
+                        if not refreshed.profile_source or refreshed.profile_source == "unknown":
+                            refreshed.profile_source = "sub2api_relogin"
+                        db_update.commit()
+                finally:
+                    db_update.close()
                 await self._finish_item(
                     job_id,
                     item_id,

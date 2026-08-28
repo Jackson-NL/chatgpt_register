@@ -31,6 +31,54 @@ from app.services.registrator import (
 )
 
 
+class OAuthLiveLogTests(unittest.TestCase):
+    def test_emit_log_publishes_live_buffer_before_console_output(self):
+        from app.services import registrator as registrator_module
+
+        registrator_module.clear_oauth_logs()
+
+        def broken_console(*_args, **_kwargs):
+            raise RuntimeError("stdout pipe blocked")
+
+        with (
+            patch.object(registrator_module, "enqueue_console_print", broken_console),
+            patch.object(registrator_module, "_schedule_oauth_log_persistence", lambda *_args, **_kwargs: None),
+        ):
+            registrator_module.emit_log("oauth first line", flush=True)
+
+        logs = registrator_module.get_oauth_logs(after=0, limit=10)
+        self.assertEqual(logs["items"][-1]["msg"], "oauth first line")
+
+
+class OAuthTokenExchangeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exchange_code_reports_timeout_type_and_proxy(self):
+        from app.services import registrator as registrator_module
+
+        class TimeoutClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def post(self, *args, **kwargs):
+                raise registrator_module.httpx.ReadTimeout("upstream stalled")
+
+        with patch.object(registrator_module.httpx, "AsyncClient", return_value=TimeoutClient()):
+            with self.assertRaises(registrator_module.RegisterError) as ctx:
+                await registrator_module.exchange_code(
+                    "callback-code",
+                    "verifier",
+                    "http://localhost:1455/auth/callback",
+                    "http://127.0.0.1:7890",
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("令牌交换超时", message)
+        self.assertIn("ReadTimeout", message)
+        self.assertIn("127.0.0.1:7890", message)
+
+
 class DebugBrowserContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_before_closing_browser_after_final_failure(self):
         entered = asyncio.Event()
@@ -788,6 +836,13 @@ class ProviderUnavailableTests(unittest.TestCase):
         self.assertTrue(_is_openai_risk("OpenAI 风控：invalid_auth_step"))
         self.assertFalse(_is_openai_risk("Phone number required | Invalid number"))
 
+    def test_detects_phone_already_used(self):
+        from app.services.registrator import _is_phone_already_used
+
+        self.assertTrue(_is_phone_already_used("Phone number already in use. Please use a different phone number."))
+        self.assertTrue(_is_phone_already_used("手机号已被使用"))
+        self.assertFalse(_is_phone_already_used("Phone number required | Invalid number"))
+
 
 class TotpBindingTests(unittest.IsolatedAsyncioTestCase):
     async def test_required_totp_retries_enrollment_when_first_response_has_no_secret(self):
@@ -857,6 +912,41 @@ class TotpBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OAuthFromProfileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_choose_account_prefers_the_matching_profile_email(self):
+        from app.services.registrator import Registrator
+
+        selected = []
+
+        class FakeLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def is_visible(self):
+                return True
+
+            async def click(self, **_kwargs):
+                selected.append("clicked")
+
+        class FakePage:
+            url = "https://auth.openai.com/choose-an-account"
+
+            def get_by_role(self, role, name, **_kwargs):
+                self.role = role
+                self.name = name
+                return FakeLocator()
+
+        page = FakePage()
+        clicked = await Registrator(None)._click_oauth_action(page, "profile@example.com")
+
+        self.assertTrue(clicked)
+        self.assertEqual(page.role, "button")
+        self.assertIn("profile@example\\.com", page.name.pattern)
+        self.assertEqual(selected, ["clicked"])
+
     async def test_oauth_mfa_challenge_fills_totp_and_submits(self):
         from app.services import registrator as registrator_module
 
@@ -1492,6 +1582,57 @@ class OAuthFromProfileTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status_calls, [])
         self.assertEqual(cancelled, ["act-openai-risk"])
+        capture_debug.assert_not_awaited()
+
+    async def test_oauth_phone_already_used_skips_screenshot_and_sms_polling(self):
+        from app.services import registrator as registrator_module
+
+        cancelled = []
+        status_calls = []
+
+        class FakePage:
+            url = "https://auth.openai.com/add-phone"
+
+            def get_by_role(self, *args, **kwargs):
+                return FakeLocator()
+
+            async def wait_for_timeout(self, ms):
+                return None
+
+        class FakeLocator:
+            @property
+            def first(self):
+                return self
+
+        class FakeSms:
+            async def get_status(self, activation_id):
+                status_calls.append(activation_id)
+                return "code", "123456"
+
+            async def set_status(self, activation_id, status, last_code=None):
+                if status == 8:
+                    cancelled.append(activation_id)
+                return "ACCESS_CANCEL"
+
+        page_errors = [[], ["Phone number already in use. Please use a different phone number."]]
+
+        async def fake_errors(self, page):
+            return page_errors.pop(0) if page_errors else []
+
+        with (
+            patch.object(registrator_module.Registrator, "_select_oauth_sms_channel", AsyncMock()),
+            patch.object(registrator_module.Registrator, "_oauth_phone_errors", fake_errors),
+            patch.object(registrator_module.Registrator, "_has_oauth_code_input", AsyncMock(return_value=False)),
+            patch.object(registrator_module.Registrator, "_capture_oauth_debug", AsyncMock()) as capture_debug,
+            patch.object(registrator_module, "click_locator", AsyncMock(return_value=True)),
+        ):
+            with self.assertRaisesRegex(registrator_module.RegisterError, "手机号已被使用"):
+                await Registrator(FakeSms())._submit_oauth_phone_and_wait_sms(
+                    FakePage(), "act-phone-used", sms_poll_timeout=60, sms_poll_interval=0.01
+                )
+
+        self.assertEqual(status_calls, [])
+        self.assertEqual(cancelled, ["act-phone-used"])
         capture_debug.assert_not_awaited()
 
     async def test_oauth_phone_replaces_number_without_polling_when_whatsapp_appears_during_sms_poll(self):

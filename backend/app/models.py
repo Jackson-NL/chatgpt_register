@@ -26,6 +26,9 @@ class Account(Base):
     totp_secret: Mapped[str] = mapped_column(Text, default="")
     proxy: Mapped[str] = mapped_column(String(512), default="")
     profile_path: Mapped[str] = mapped_column(String(512), default="")
+    # Profile 生命周期元数据：用于判断是否仍需保留浏览器登录态及清理来源。
+    profile_source: Mapped[str] = mapped_column(String(32), default="unknown", index=True)
+    profile_last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     warmup_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")

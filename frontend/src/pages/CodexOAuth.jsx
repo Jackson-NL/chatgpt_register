@@ -147,7 +147,7 @@ function CountryMultiSelect({ value, onChange, options = OAUTH_COUNTRY_OPTIONS, 
         </span>
         <ChevronDown size={14} className="shrink-0 text-slate-400" />
       </button>
-      <div className="mt-1 text-[11px] leading-relaxed text-slate-400">{t("先试第 1 个国家；失败后按顺序切换。超过 3 个时自动保留最新 3 个。")}</div>
+      <div className="mt-1 text-[11px] leading-relaxed text-slate-400">{t("先试第 1 个国家；同一轮价位候选会并发取号；超过 3 个时自动保留最新 3 个。")}</div>
       {open && (
         <div className="absolute z-40 mt-1 w-full overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-100 p-2">
@@ -622,7 +622,6 @@ export default function CodexOAuth() {
               <MetricCard label="待处理" value={pendingCount} tone="blue" />
             </div>
           </Panel>
-
           <Panel title="授权参数" extra={<Badge color="neutral">保存后复用</Badge>}>
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -645,6 +644,7 @@ export default function CodexOAuth() {
               </div>
             </div>
           </Panel>
+
         </div>
       </div>
 

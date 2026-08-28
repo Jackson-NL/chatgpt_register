@@ -1,7 +1,10 @@
 from pathlib import Path
 from datetime import datetime, timezone
+import threading
+import time
 
-from sqlalchemy import create_engine, update
+from sqlalchemy import create_engine, event, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
@@ -10,10 +13,31 @@ Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(
     f"sqlite:///{settings.db_path}",
-    connect_args={"check_same_thread": False, "timeout": 10},
+    connect_args={"check_same_thread": False, "timeout": 30},
 )
 
+
+@event.listens_for(engine, "connect")
+def _configure_sqlite_connection(dbapi_connection, _connection_record):
+    """Reduce write-lock failures under concurrent browser/job updates."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+_COOLDOWN_RELEASE_INTERVAL_SECONDS = 60.0
+_COOLDOWN_RELEASE_LOCK = threading.Lock()
+_COOLDOWN_RELEASE_LAST_RUN = 0.0
+
+
+def _is_sqlite_locked(error: BaseException) -> bool:
+    return "database is locked" in str(error).lower()
 
 
 class Base(DeclarativeBase):
@@ -23,29 +47,64 @@ class Base(DeclarativeBase):
 def get_db():
     db = SessionLocal()
     try:
-        release_expired_account_cooldowns(db)
+        # Cooldown release is opportunistic maintenance.  It must not turn
+        # read-heavy UI polling into SQLite write-lock failures.
+        maybe_release_expired_account_cooldowns(db)
         yield db
     finally:
         db.close()
 
 
+def maybe_release_expired_account_cooldowns(db) -> int:
+    """Occasionally release cooled accounts without blocking normal requests."""
+    global _COOLDOWN_RELEASE_LAST_RUN
+    now_monotonic = time.monotonic()
+    if now_monotonic - _COOLDOWN_RELEASE_LAST_RUN < _COOLDOWN_RELEASE_INTERVAL_SECONDS:
+        return 0
+    if not _COOLDOWN_RELEASE_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now_monotonic = time.monotonic()
+        if now_monotonic - _COOLDOWN_RELEASE_LAST_RUN < _COOLDOWN_RELEASE_INTERVAL_SECONDS:
+            return 0
+        try:
+            released = release_expired_account_cooldowns(db)
+        except OperationalError as error:
+            db.rollback()
+            if not _is_sqlite_locked(error):
+                raise
+            return 0
+        finally:
+            _COOLDOWN_RELEASE_LAST_RUN = time.monotonic()
+        return released
+    finally:
+        _COOLDOWN_RELEASE_LOCK.release()
+
+
 def release_expired_account_cooldowns(db) -> int:
-    """将到期的注册冷却账号恢复为可用状态。"""
+    """将到期的注册冷却账号恢复为可用状态，并立即结束写事务。"""
     from .models import Account
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    result = db.execute(
-        update(Account)
-        .where(
-            Account.status == "cooling",
-            Account.warmup_until.is_not(None),
-            Account.warmup_until <= now,
+    try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        result = db.execute(
+            update(Account)
+            .where(
+                Account.status == "cooling",
+                Account.warmup_until.is_not(None),
+                Account.warmup_until <= now,
+            )
+            .values(status="active", warmup_until=None)
         )
-        .values(status="active", warmup_until=None)
-    )
-    if result.rowcount:
+        released = result.rowcount or 0
+        # UPDATE starts a SQLite write transaction even when no rows match.
+        # Commit every time so GET endpoints do not hold a writer lock while
+        # the actual API handler continues reading.
         db.commit()
-    return result.rowcount or 0
+        return released
+    except Exception:
+        db.rollback()
+        raise
 
 
 def init_db():
@@ -89,9 +148,14 @@ def _migrate_legacy_tables(target_engine=None):
                 conn.execute(text("ALTER TABLE accounts ADD COLUMN quota_json TEXT DEFAULT ''"))
             if "mail_provider" not in cols:
                 conn.execute(text("ALTER TABLE accounts ADD COLUMN mail_provider VARCHAR(32) DEFAULT 'unknown'"))
+            if "profile_source" not in cols:
+                conn.execute(text("ALTER TABLE accounts ADD COLUMN profile_source VARCHAR(32) DEFAULT 'unknown'"))
+            if "profile_last_used_at" not in cols:
+                conn.execute(text("ALTER TABLE accounts ADD COLUMN profile_last_used_at DATETIME"))
             if "tag" not in cols:
                 conn.execute(text("ALTER TABLE accounts ADD COLUMN tag VARCHAR(64) DEFAULT ''"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_accounts_mail_provider ON accounts (mail_provider)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_accounts_profile_source ON accounts (profile_source)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_accounts_tag ON accounts (tag)"))
     if "registrations" in tables:
         cols = tables["registrations"]

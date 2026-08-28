@@ -20,6 +20,7 @@ import {
   paginateRecords,
   parseRegisterResult,
   normalizeRegisterConfig,
+  pickDisplayRegister,
   readStoredRegisterConfig,
   saveStoredRegisterConfig,
   shouldAutoScrollLog,
@@ -145,6 +146,19 @@ test("normalizeRegisterStatus: idle when nothing present", () => {
   assert.equal(state.label, "空闲");
   assert.equal(state.active, false);
   assert.equal(state.taskLabel, "");
+});
+
+test("pickDisplayRegister refreshes a stale focused record from history or batch state", () => {
+  const focusedReg = { id: 7, status: "running", batch_id: 2 };
+  const historyRows = [{ id: 7, status: "success", batch_id: 2 }];
+  assert.equal(pickDisplayRegister({ focusedReg, historyRows })?.status, "success");
+
+  const batchActive = {
+    id: 2,
+    status: "running",
+    registrations: [{ id: 7, status: "success", batch_id: 2 }],
+  };
+  assert.equal(pickDisplayRegister({ focusedReg, batchActive, historyRows })?.status, "success");
 });
 
 test("isTaskMissingError detects 404 / not found / 不存在", () => {

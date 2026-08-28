@@ -539,7 +539,7 @@ const EN = {
   "请选择国家": "Select countries",
   "搜索国家 / 区号 / SMSBower id": "Search country / calling code / SMSBower ID",
   "没有匹配国家": "No matching countries",
-  "先试第 1 个国家；失败后按顺序切换。超过 3 个时自动保留最新 3 个。": "Try country 1 first; switch in order after failure. When more than 3 are selected, keep the latest 3.",
+  "先试第 1 个国家；同一轮价位候选会并发取号；超过 3 个时自动保留最新 3 个。": "Try country 1 first; each price-tier round rents candidates in parallel. When more than 3 are selected, keep the latest 3.",
   "已选择 3 个，继续选择会自动移除最早的国家": "3 countries selected; choosing another removes the oldest one",
   "准备 profile": "Prepare profile",
   "打开 OAuth": "Open OAuth",

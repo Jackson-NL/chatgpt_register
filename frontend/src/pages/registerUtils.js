@@ -201,6 +201,31 @@ export function normalizeRegisterStatus(reg, batch) {
   return { key: "idle", label: "空闲", color: "neutral", active: false, taskLabel: "" };
 }
 
+/**
+ * 选择注册工作台当前应展示的任务。
+ * 优先级：点击聚焦的记录 > 批量运行中的当前记录 > 历史运行中记录 > 当前 active > 最近历史记录。
+ */
+export function pickDisplayRegister({ focusedReg = null, batchActive = null, active = null, historyRows = [] } = {}) {
+  const batchIsRunning = batchActive?.status === "running";
+  const focusedId = focusedReg?.id ?? null;
+  const latestFocusedReg = focusedId
+    ? (batchActive?.registrations?.find((r) => r.id === focusedId)
+      || historyRows.find((r) => r.id === focusedId)
+      || (active?.id === focusedId ? active : null)
+      || focusedReg)
+    : null;
+  const historyRunningReg = historyRows.find((r) => isRunningStatus(r.status)) || null;
+  const batchFocusedReg = batchIsRunning
+    ? batchActive.registrations?.find((r) => isRunningStatus(r.status)) || batchActive.registrations?.[0] || null
+    : null;
+  const activeBatchReg = batchIsRunning && active?.batch_id === batchActive?.id && isRunningStatus(active.status)
+    ? active
+    : null;
+  return latestFocusedReg || (batchIsRunning
+    ? (activeBatchReg || batchFocusedReg || null)
+    : (historyRunningReg || (active && isRunningStatus(active.status) ? active : null) || historyRows[0] || null));
+}
+
 /** 任务不存在错误识别：404 / not found / 不存在 / 已删除 等。 */
 export function isTaskMissingError(error) {
   const msg = String((error && (error.message || error)) || "").toLowerCase();

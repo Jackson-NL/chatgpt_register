@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     sub2api_jwt: str = ""
     sub2api_timeout: float = 30
     sub2api_group_ids: str = ""
+    # 留空时使用 SUB2API_BASE_URL/auth/callback；Sub2API 生成重登链接时使用该远端回调，
+    # 因此本地浏览器不需要监听 OAuth callback 端口。
+    sub2api_reauth_redirect_uri: str = ""
 
     # ---------- 管理员入口 ----------
     # 只从 backend/.env 或运行环境读取，不回传到前端。

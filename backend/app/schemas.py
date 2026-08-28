@@ -37,6 +37,8 @@ class AccountOut(OrmModel):
     plan_type: str
     proxy: str
     profile_path: str
+    profile_source: str = "unknown"
+    profile_last_used_at: datetime | None = None
     note: str = ""
     tag: str = ""
     warmup_until: datetime | None = None

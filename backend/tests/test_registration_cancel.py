@@ -45,6 +45,117 @@ def test_cancel_registration_endpoint_marks_running_registration_canceled(monkey
     assert db.get(Registration, reg_id).status == "canceled"
 
 
+
+def test_submit_retries_transient_sqlite_database_lock(monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    class FakeDb:
+        def __init__(self):
+            self.commits = 0
+            self.closed = False
+
+        def add(self, reg):
+            self.reg = reg
+
+        def commit(self):
+            self.commits += 1
+            if self.commits == 1:
+                raise OperationalError("INSERT INTO registrations", {}, Exception("database is locked"))
+            self.reg.id = 123
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def refresh(self, reg):
+            reg.id = 123
+
+        def close(self):
+            self.closed = True
+
+        def get(self, *_args, **_kwargs):
+            return None
+
+    fake_db = FakeDb()
+    created_tasks = []
+
+    class FakeLoop:
+        def create_task(self, coro):
+            coro.close()
+            created_tasks.append(coro)
+            return asyncio.Future()
+
+    monkeypatch.setattr(registration_service, "SessionLocal", lambda: fake_db)
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(registration_service, "_JOBS", {})
+
+    async def exercise():
+        service = RegistrationService()
+        reg_id = await service.submit()
+        assert reg_id == 123
+
+    asyncio.run(exercise())
+    assert fake_db.commits == 2
+    assert getattr(fake_db, "rolled_back", False) is True
+    assert fake_db.closed is True
+    assert 123 in registration_service._JOBS
+
+
+
+def test_get_db_ignores_transient_cooldown_sqlite_lock(monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from app import db as db_module
+
+    class FakeSession:
+        rolled_back = False
+        closed = False
+
+        def execute(self, *_args, **_kwargs):
+            raise OperationalError("UPDATE accounts", {}, Exception("database is locked"))
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeSession()
+    monkeypatch.setattr(db_module, "SessionLocal", lambda: fake)
+    monkeypatch.setattr(db_module, "_COOLDOWN_RELEASE_LAST_RUN", 0.0)
+
+    gen = db_module.get_db()
+    yielded = next(gen)
+    assert yielded is fake
+    assert fake.rolled_back is True
+    try:
+        next(gen)
+    except StopIteration:
+        pass
+    assert fake.closed is True
+
+
+def test_release_expired_account_cooldowns_commits_even_when_no_rows(monkeypatch):
+    from app import db as db_module
+
+    class FakeResult:
+        rowcount = 0
+
+    class FakeSession:
+        committed = False
+
+        def execute(self, *_args, **_kwargs):
+            return FakeResult()
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            raise AssertionError("rollback should not be called")
+
+    fake = FakeSession()
+    assert db_module.release_expired_account_cooldowns(fake) == 0
+    assert fake.committed is True
+
+
 def test_registration_placeholder_phone_avoids_legacy_and_existing_values():
     db = _db_session()
     db.add_all(
@@ -68,6 +179,48 @@ def _patch_rotate(monkeypatch, calls):
         return {"ok": True, "before": "nodeA", "after": "nodeB", "ip": "203.0.113.7"}
 
     monkeypatch.setattr("app.services.clash_verge.rotate_clash_proxy_for_round", fake_rotate)
+
+
+
+def test_guarded_registration_logs_pre_run_rotation(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    reg = Registration(status="pending", proxy="http://127.0.0.1:7890")
+    db.add(reg)
+    db.commit()
+    reg_id = reg.id
+    db.close()
+
+    monkeypatch.setattr(registration_service, "SessionLocal", Session)
+    monkeypatch.setattr(registration_service.settings, "clash_rotate_enabled", True)
+
+    async def fake_rotate(*, log=None, proxy="", controller_url="", selector_name=""):
+        if log:
+            log("[proxy] 测试轮换日志")
+        return {"ok": True, "before": "A", "after": "B", "ip": "203.0.113.9"}
+
+    async def fake_run(self, rid, manage_log_context=True):
+        from app.services.registrator import emit_log
+
+        emit_log(f"[registration:{rid}] fake run")
+        registration_service._JOBS.pop(rid, None)
+
+    monkeypatch.setattr("app.services.clash_verge.rotate_clash_proxy_for_round", fake_rotate)
+    monkeypatch.setattr(RegistrationService, "_run", fake_run)
+
+    async def exercise():
+        service = RegistrationService(concurrency=1)
+        task = asyncio.create_task(service.submit())
+        created_id = await task
+        logs = service.get_logs(created_id, after=0, limit=50)["logs"]
+        messages = [line["msg"] for line in logs]
+        assert any("已启动后台任务" in message for message in messages)
+        assert any("测试轮换日志" in message for message in messages)
+        assert any("fake run" in message for message in messages)
+
+    asyncio.run(exercise())
 
 
 def test_quiesced_rotation_runs_when_no_other_registration_active(monkeypatch):
@@ -255,3 +408,4 @@ def test_cancel_registration_releases_debug_wait_before_canceling_task(monkeypat
             registration_service._JOBS.pop(reg_id, None)
 
     asyncio.run(exercise())
+

@@ -52,10 +52,43 @@ async def profile_lease(profile_path: str):
 
 @asynccontextmanager
 async def locked_camoufox(launch_options: dict, launcher):
-    """Launch Camoufox while holding the lease for its persistent profile."""
+    """Launch Camoufox while holding the lease for its persistent profile.
+
+    Browser shutdown must complete before the lease is released.  OAuth job
+    cancellation otherwise lets a replacement task reopen Firefox while its
+    previous persistent context is still closing.
+    """
     async with profile_lease(str(launch_options.get("user_data_dir") or "")):
-        async with launcher(**launch_options) as browser:
+        manager = launcher(**launch_options)
+        browser = await manager.__aenter__()
+        exit_args = (None, None, None)
+        try:
             yield browser
+        except BaseException as exc:
+            exit_args = (type(exc), exc, exc.__traceback__)
+            raise
+        finally:
+            close_task = asyncio.create_task(manager.__aexit__(*exit_args))
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                # A cancelled OAuth job must still finish closing Firefox;
+                # otherwise a following job collides with the profile lock.
+                await asyncio.shield(close_task)
+                raise
+            finally:
+                # Firefox can recreate these directories on every run; remove
+                # them only after the process has fully exited.
+                profile_path = launch_options.get("user_data_dir")
+                if profile_path:
+                    from .profile_lifecycle import cleanup_profile_runtime_artifacts
+
+                    try:
+                        cleanup_profile_runtime_artifacts(profile_path)
+                    except (OSError, ValueError):
+                        # Launch callers may use an ephemeral external profile;
+                        # lifecycle cleanup is intentionally scoped to our root.
+                        pass
 
 
 def build_launch_options(

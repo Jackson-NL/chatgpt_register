@@ -84,6 +84,36 @@ def test_profile_lease_allows_distinct_profiles():
     asyncio.run(run())
 
 
+def test_locked_camoufox_finishes_cleanup_after_task_cancellation():
+    events = []
+
+    class FakeManager:
+        async def __aenter__(self):
+            events.append("enter")
+            return self
+
+        async def __aexit__(self, *_args):
+            await asyncio.sleep(0)
+            events.append("exit")
+
+    async def worker():
+        async with browser_stack.locked_camoufox(
+            {"user_data_dir": "D:/profiles/worker_reg_cancel"},
+            lambda **_options: FakeManager(),
+        ):
+            await asyncio.Event().wait()
+
+    async def run():
+        task = asyncio.create_task(worker())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert events == ["enter", "exit"]
+
+
 def test_detect_proxy_region_uses_proxy_and_returns_country(monkeypatch):
     calls = []
 

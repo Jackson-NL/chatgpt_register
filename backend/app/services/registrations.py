@@ -5,6 +5,7 @@ import re
 from datetime import timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from ..config import settings
 from ..db import SessionLocal
@@ -14,14 +15,42 @@ from .registrator import (
     clear_log_sink, gen_password, reset_log_source, set_log_sink, set_log_source,
 )
 from .browser_stack import make_profile_path
+from .profile_lifecycle import remove_profile_tree
 from .mail_providers.base import effective_mail_provider_name
 from .smsbower import SmsbowerClient
 from .smsbower_mail import SmsbowerMailClient
 
 _JOBS: dict[int, asyncio.Task] = {}
+_DB_LOCK_RETRY_DELAYS = (0.2, 0.5, 1.0)
 MAX_LOG_LINES = 500
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_.\-]{20,}")
 _TOTP_RE = re.compile(r"\b[A-Z2-7]{32}\b")
+
+
+def _is_sqlite_locked(error: OperationalError) -> bool:
+    return "database is locked" in str(error).lower()
+
+
+async def _commit_registration_with_retry(db, reg: Registration) -> int:
+    """Insert a registration row, tolerating transient SQLite writer locks."""
+    last_error: OperationalError | None = None
+    total_attempts = len(_DB_LOCK_RETRY_DELAYS) + 1
+    for attempt in range(total_attempts):
+        if attempt:
+            await asyncio.sleep(_DB_LOCK_RETRY_DELAYS[attempt - 1])
+        try:
+            db.add(reg)
+            db.commit()
+            db.refresh(reg)
+            return int(reg.id)
+        except OperationalError as error:
+            db.rollback()
+            if not _is_sqlite_locked(error) or attempt == total_attempts - 1:
+                raise
+            last_error = error
+    if last_error is not None:  # defensive; loop normally returns or raises.
+        raise last_error
+    raise RuntimeError("registration commit retry exhausted")
 
 
 def resolve_registration_mail_provider(gmail_alias: str, gmail_mail_id: str) -> str:
@@ -161,6 +190,14 @@ class RegistrationService:
     def start(self) -> None:
         self._started = True
 
+
+    def _ensure_log_buffer(self, reg_id: int) -> list:
+        lines = self._log_buffers.get(reg_id)
+        if lines is None:
+            lines = []
+            self._log_buffers[reg_id] = lines
+        return lines
+
     def get_logs(self, reg_id: int, after: int = 0, limit: int = 200) -> dict:
         """增量读取该任务日志：优先内存缓冲，任务结束后从 DB logs_json 回放。"""
         lines = self._log_buffers.get(reg_id)
@@ -235,14 +272,17 @@ class RegistrationService:
                     f"{rotation.get('error') or rotation.get('reason') or '未知原因'}；继续用当前出口"
                 )
 
-    async def _run(self, reg_id: int) -> None:
+    async def _run(self, reg_id: int, manage_log_context: bool = True) -> None:
         db = SessionLocal()
-        lines: list = []
-        self._log_buffers[reg_id] = lines
-        set_log_sink(reg_id, lines)
-        # 标记本任务日志来源为 register，使 emit_log 只写入本任务的 sink（落库），
-        # 不再写入 OAuth 全局缓冲，从而实现与 Codex OAuth 的日志隔离。
-        src_token = set_log_source("register")
+        lines = self._ensure_log_buffer(reg_id)
+        profile_path = ""
+        profile_persisted = False
+        src_token = None
+        if manage_log_context:
+            set_log_sink(reg_id, lines)
+            # 标记本任务日志来源为 register，使 emit_log 只写入本任务的 sink（落库），
+            # 不再写入 OAuth 全局缓冲，从而实现与 Codex OAuth 的日志隔离。
+            src_token = set_log_source("register")
         try:
             reg = db.get(Registration, reg_id)
             if not reg:
@@ -329,6 +369,8 @@ class RegistrationService:
                 phone=placeholder_phone,  # phone 列 unique；邮箱注册账号使用注册专用占位值
                 proxy=reg.proxy,
                 profile_path=profile_path,
+                profile_source="registration",
+                profile_last_used_at=utcnow(),
                 # 邮箱来源随 Registration 落库复制；旧记录缺字段时按 Gmail 订单兜底判定
                 mail_provider=(getattr(reg, "mail_provider", "") or "").strip()
                 or resolve_registration_mail_provider(reg.gmail_alias, reg.gmail_mail_id),
@@ -353,6 +395,7 @@ class RegistrationService:
             reg.result_json = json.dumps(gmail_draft, ensure_ascii=False)
             reg.finished_at = utcnow()
             db.commit()
+            profile_persisted = True
             emit_log(f"[registration:{reg_id}] 成功 account_id={account.id} email={account.email} totp={bool(account.totp_secret)}")
             if account.warmup_until:
                 emit_log(f"[system] 账号已写入账号管理，进入冷却期至 {account.warmup_until.isoformat()}Z；冷却期内跳过远端健康检查")
@@ -417,6 +460,11 @@ class RegistrationService:
             except Exception:
                 db.rollback()
         finally:
+            if profile_path and not profile_persisted:
+                try:
+                    remove_profile_tree(profile_path)
+                except (OSError, ValueError):
+                    pass
             if len(lines) > MAX_LOG_LINES:
                 lines[:] = lines[-MAX_LOG_LINES:]
             # 持久化日志（任务结束后可从 DB 回放）
@@ -438,8 +486,10 @@ class RegistrationService:
             except Exception:  # noqa: BLE001
                 pass
             db.close()
-            clear_log_sink(reg_id)
-            reset_log_source(src_token)
+            if manage_log_context:
+                clear_log_sink(reg_id)
+                if src_token is not None:
+                    reset_log_source(src_token)
             _JOBS.pop(reg_id, None)
 
     async def submit(self, proxy: str = "", headless: bool = True, bind_totp: bool = True, batch_id: int | None = None,
@@ -463,16 +513,16 @@ class RegistrationService:
                 mail_provider=resolve_registration_mail_provider(gmail_alias, gmail_mail_id),
                 result_json=json.dumps(draft, ensure_ascii=False),
             )
-            db.add(reg)
-            db.commit()
-            db.refresh(reg)
-            reg_id = reg.id
+            reg_id = await _commit_registration_with_retry(db, reg)
         finally:
             db.close()
 
         async def _guarded() -> None:
             async with self._sem:
                 self._active += 1
+                lines = self._ensure_log_buffer(reg_id)
+                set_log_sink(reg_id, lines)
+                src_token = set_log_source("register")
                 try:
                     gmail_mode = False
                     proxy = ""
@@ -484,9 +534,14 @@ class RegistrationService:
                             proxy = reg.proxy or ""
                     finally:
                         db.close()
+                    from .registrator import emit_log
+
+                    emit_log(f"[registration:{reg_id}] 已启动后台任务，准备静默期换节点")
                     await self._rotate_node_for_fresh_registration(reg_id, gmail_mode, proxy)
-                    await self._run(reg_id)
+                    await self._run(reg_id, manage_log_context=False)
                 finally:
+                    clear_log_sink(reg_id)
+                    reset_log_source(src_token)
                     self._active -= 1
 
         _JOBS[reg_id] = asyncio.get_running_loop().create_task(_guarded())
