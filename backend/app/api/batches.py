@@ -84,7 +84,11 @@ async def cancel_batch(batch_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{batch_id}/logs")
 def get_batch_logs(batch_id: int, after: int = 0, limit: int = 300, db: Session = Depends(get_db)):
-    """读取批量协调阶段日志，覆盖 Gmail 注册创建 registration 之前的阶段。"""
+    """读取批量协调阶段日志，覆盖 Gmail 注册创建 registration 之前的阶段。
+
+    按 seq 正向分页：如果前端长时间未轮询且积压超过 limit，也不会直接跳到
+    最新尾部导致中间日志丢失。limit<=0 用于复制/下载完整日志。
+    """
     batch = db.get(Batch, batch_id)
     if not batch:
         raise HTTPException(404, "批量任务不存在")
@@ -93,12 +97,17 @@ def get_batch_logs(batch_id: int, after: int = 0, limit: int = 300, db: Session 
     except (TypeError, ValueError):
         lines = []
     safe_after = max(0, int(after or 0))
-    safe_limit = min(max(1, int(limit or 300)), 1000)
+    safe_limit = max(0, int(limit or 0))
     output = [line for line in lines if int(line.get("seq", 0)) > safe_after]
-    output = output[-safe_limit:]
+    if safe_limit > 0:
+        output = output[:safe_limit]
+    latest_seq = int(lines[-1].get("seq", safe_after)) if lines else safe_after
+    next_seq = int(output[-1].get("seq", safe_after)) if output else latest_seq
     return {
         "logs": output,
-        "next": int(lines[-1].get("seq", safe_after)) if lines else safe_after,
+        "next": next_seq,
+        "latest": latest_seq,
+        "has_more": bool(output and next_seq < latest_seq),
         "total": len(lines),
     }
 

@@ -1,7 +1,10 @@
 export const MAX_OAUTH_COUNTRIES = 3;
 export const OAUTH_FORM_STORAGE_KEY = "codex_oauth_params_v1";
 export const OAUTH_RUNTIME_STORAGE_KEY = "codex_oauth_runtime_v1";
-const MAX_PERSISTED_OAUTH_LOGS = 2000;
+export const MAX_PERSISTED_OAUTH_LOGS = 800;
+export const MAX_RENDERED_OAUTH_LOGS = 400;
+export const OAUTH_LOG_POLL_VISIBLE_MS = 800;
+export const OAUTH_LOG_POLL_HIDDEN_MS = 5000;
 
 import { api } from "../api/index.js";
 
@@ -123,10 +126,43 @@ export function shouldAutoScrollOAuthLogs({
   return Number(scrollHeight) - Number(scrollTop) - Number(clientHeight) <= Number(threshold);
 }
 
+export function shouldFollowOAuthLogTail({
+  running = false,
+  stickToBottom = true,
+  scrollTop = 0,
+  clientHeight = 0,
+  scrollHeight = 0,
+  threshold = 48,
+} = {}) {
+  if (running || stickToBottom) return true;
+  return shouldAutoScrollOAuthLogs({ running: false, scrollTop, clientHeight, scrollHeight, threshold });
+}
+
 export function shouldPollOAuthBackendLogs({ pageMounted = true } = {}) {
   // 后台轮询已与页面挂载解耦：只要存在运行中的任务或后台 job，就持续收集日志，
   // 这样在注册工作台等其它模块停留时，OAuth 日志也会持续累积，切回时不丢历史。
   return Boolean(pageMounted);
+}
+
+export function oauthBackendLogPollDelay({ hidden = false } = {}) {
+  return hidden ? OAUTH_LOG_POLL_HIDDEN_MS : OAUTH_LOG_POLL_VISIBLE_MS;
+}
+
+export function trimOAuthLogs(logs, limit = MAX_PERSISTED_OAUTH_LOGS) {
+  const items = Array.isArray(logs) ? logs : [];
+  const size = Math.max(0, Number(limit) || 0);
+  return size > 0 ? items.slice(-size) : [];
+}
+
+export function visibleOAuthLogs(logs, limit = MAX_RENDERED_OAUTH_LOGS) {
+  return trimOAuthLogs(logs, limit);
+}
+
+export function oauthLogScrollSignal(logs) {
+  const items = Array.isArray(logs) ? logs : [];
+  const last = items.at(-1);
+  if (!last) return "";
+  return String(last.id || last.backend_seq || `${items.length}:${last.time || ""}:${last.message || ""}`);
 }
 
 // ------------------------------------------------------------------
@@ -137,9 +173,12 @@ let oauthBackendLogTimer = null;
 let oauthBackendLogActive = false;
 let oauthBackendLogErrShown = false;
 
+export function shouldPollOAuthBackendLogsNow(snapshot = {}) {
+  return Boolean(snapshot?.running || snapshot?.backendJobId);
+}
+
 function oauthBackendLogPollingNeeded() {
-  const snap = codexOAuthRuntime.getSnapshot();
-  return Boolean(snap.running);
+  return shouldPollOAuthBackendLogsNow(codexOAuthRuntime.getSnapshot());
 }
 
 export async function pollOAuthBackendLogsOnce() {
@@ -186,7 +225,7 @@ export async function pollOAuthBackendLogsOnce() {
         nextLogs.push(log);
       }
     }
-    return { logs: nextLogs, backendLogSeq: nextSeq };
+    return { logs: trimOAuthLogs(nextLogs), backendLogSeq: nextSeq };
   });
 }
 
@@ -205,7 +244,8 @@ export function startOAuthBackendLogPolling() {
         // 单轮异常忽略，下一轮继续。
       }
     }
-    oauthBackendLogTimer = globalThis.setTimeout(loop, 800);
+    const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+    oauthBackendLogTimer = globalThis.setTimeout(loop, oauthBackendLogPollDelay({ hidden }));
   };
   loop();
 }
@@ -308,7 +348,7 @@ function persistOAuthRuntime(state, storage) {
     backendJobId: String(state.backendJobId || ""),
     targetCount: Number.isFinite(Number(state.targetCount)) ? Number(state.targetCount) : 0,
     results: Array.isArray(state.results) ? state.results : [],
-    logs: Array.isArray(state.logs) ? state.logs.slice(-MAX_PERSISTED_OAUTH_LOGS) : [],
+    logs: trimOAuthLogs(state.logs),
     backendLogSeq: Number.isFinite(Number(state.backendLogSeq)) ? Number(state.backendLogSeq) : 0,
     concurrency: Number.isFinite(Number(state.concurrency)) ? Number(state.concurrency) : DEFAULT_OAUTH_PARAMS.concurrency,
     activeAccountIds: Array.isArray(state.activeAccountIds) ? state.activeAccountIds : [],
@@ -329,9 +369,11 @@ export function createOAuthRuntimeStore(initial = {}, storage) {
     results: Array.isArray(initial.results)
       ? [...initial.results]
       : Array.isArray(persisted.results) ? [...persisted.results] : [],
-    logs: Array.isArray(initial.logs)
-      ? normalizeOAuthRuntimeLogs(initial.logs)
-      : normalizeOAuthRuntimeLogs(persisted.logs),
+    logs: trimOAuthLogs(
+      Array.isArray(initial.logs)
+        ? normalizeOAuthRuntimeLogs(initial.logs)
+        : normalizeOAuthRuntimeLogs(persisted.logs),
+    ),
   };
   // A persisted running flag may describe a browser tab that was closed. The
   // active-job recovery effect will restore it from the backend when needed.
@@ -371,7 +413,7 @@ export function createOAuthRuntimeStore(initial = {}, storage) {
       emit();
     },
     appendLog(log) {
-      state = { ...state, logs: [...state.logs, log].slice(-MAX_PERSISTED_OAUTH_LOGS) };
+      state = { ...state, logs: trimOAuthLogs([...state.logs, log]) };
       persistOAuthRuntime(state, storage);
       emit();
     },
@@ -573,6 +615,7 @@ export function oauthBlockMessage(account = {}) {
   const provider = String(account?.mail_provider || "unknown").trim().toLowerCase();
   if (!provider || provider === "unknown") return "该账号邮箱来源未知，不能进入 Codex OAuth";
   if (provider !== "gmail") return "该账号不是 Gmail 来源，不能进入 Codex OAuth";
+  if (String(account?.status || "").trim().toLowerCase() === "cooling") return "该账号仍在冷却期，不能进入 Codex OAuth";
   if (!account?.profile_path) return "该账号缺少 profile，不能进入 Codex OAuth";
   if (account?.has_refresh_token) return "该账号已有 refresh_token，不能进入 Codex OAuth";
   return "该账号不能进入 Codex OAuth";
@@ -602,6 +645,7 @@ export function oauthRowStatusLabel(account = {}) {
   const provider = oauthMailProvider(account);
   if (provider === "unknown") return "来源未知，已跳过";
   if (provider !== "gmail") return "非 Gmail，已跳过";
+  if (String(account.status || "").trim().toLowerCase() === "cooling") return "冷却中，已跳过";
   if (!account.profile_path) return "缺少 profile，已跳过";
   if (account.has_refresh_token) return "已有 refresh_token，已跳过";
   return "已跳过";

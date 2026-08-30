@@ -10,14 +10,17 @@ from app.services.registrator import (
     ABOUT_YOU_FINISH_POLL_INTERVAL_MS,
     ABOUT_YOU_FINISH_TIMEOUT_SECONDS,
     AboutYouFinishTimeoutError,
+    BIRTHDAY_ARROW_ADJUSTMENT_LIMIT,
     _birthday_iso,
     _birthday_segment_order,
     _fill_react_aria_datefield,
     _should_retry_birthday_hidden_sync,
     _birthday_submission_ready,
+    _debug_screenshot_loop,
     click_about_you_submit,
     CloudflareChallengeError,
     EmailSubmitNotConsumedError,
+    EmailPostSubmitNotConsumedError,
     _DebugBrowserContext,
     OAuthCallbackListener,
     ProxyNetworkError,
@@ -29,6 +32,7 @@ from app.services.registrator import (
     normalize_phone_number,
     pick_visible,
     submit_email_with_recovery,
+    wait_for_password_or_code_entry,
 )
 
 
@@ -49,6 +53,42 @@ class OAuthLiveLogTests(unittest.TestCase):
 
         logs = registrator_module.get_oauth_logs(after=0, limit=10)
         self.assertEqual(logs["items"][-1]["msg"], "oauth first line")
+
+
+class OAuthLogBatchWriterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app.services import registrator as registrator_module
+
+        await registrator_module.stop_oauth_log_writer()
+        registrator_module.clear_oauth_logs()
+
+    async def asyncTearDown(self):
+        from app.services import registrator as registrator_module
+
+        await registrator_module.stop_oauth_log_writer()
+        registrator_module.clear_oauth_logs()
+
+    async def test_queued_oauth_logs_flush_in_batches(self):
+        from app.services import registrator as registrator_module
+
+        persisted_batches = []
+
+        def fake_persist(rows):
+            persisted_batches.append([dict(row) for row in rows])
+
+        with (
+            patch.object(registrator_module, "start_oauth_log_writer", lambda: None),
+            patch.object(registrator_module, "_persist_oauth_logs", fake_persist),
+        ):
+            registrator_module._schedule_oauth_log_persistence(1, "03:05:57", "line 1")
+            registrator_module._schedule_oauth_log_persistence(2, "03:05:58", "line 2")
+            registrator_module._schedule_oauth_log_persistence(3, "03:05:59", "line 3")
+
+            self.assertEqual(await registrator_module._flush_oauth_log_pending(limit=2), 2)
+            self.assertEqual([row["seq"] for row in persisted_batches[0]], [1, 2])
+
+            self.assertEqual(await registrator_module._flush_oauth_log_pending(), 1)
+            self.assertEqual([row["seq"] for row in persisted_batches[1]], [3])
 
 
 class OAuthTokenExchangeTests(unittest.IsolatedAsyncioTestCase):
@@ -161,6 +201,50 @@ class DebugBrowserContextTests(unittest.IsolatedAsyncioTestCase):
         wait_for_user.assert_not_awaited()
 
 
+class DebugScreenshotLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_debug_screenshot_loop_exits_when_page_is_closed(self):
+        from app.services import registrator as registrator_module
+
+        calls = 0
+
+        class FakePage:
+            def __init__(self):
+                self.closed = False
+
+            def is_closed(self):
+                return self.closed
+
+        page = FakePage()
+
+        async def fake_capture(_page, _reg_id):
+            nonlocal calls
+            calls += 1
+            page.closed = True
+            return b"png"
+
+        with patch.object(registrator_module, "capture_screenshot", fake_capture):
+            await asyncio.wait_for(_debug_screenshot_loop(page, 123, interval_seconds=1), timeout=0.5)
+
+        self.assertEqual(calls, 1)
+
+    async def test_debug_screenshot_loop_stops_on_cancel(self):
+        from app.services import registrator as registrator_module
+
+        class FakePage:
+            def is_closed(self):
+                return False
+
+        async def fake_capture(_page, _reg_id):
+            return b"png"
+
+        with patch.object(registrator_module, "capture_screenshot", fake_capture):
+            task = asyncio.create_task(_debug_screenshot_loop(FakePage(), 123, interval_seconds=10))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+
 class VisibleLocatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_pick_visible_skips_hidden_first_match(self):
         class FakeElement:
@@ -255,6 +339,17 @@ class BirthdayStateTests(unittest.TestCase):
             [(0, "09", "day"), (1, "02", "month"), (2, "2001", "year")],
         )
 
+    def test_maps_localized_react_aria_segment_labels(self):
+        self.assertEqual(
+            _birthday_segment_order(
+                ["jour, ", "mois, ", "annee, "],
+                month=2,
+                day=9,
+                year=2001,
+            ),
+            [(0, "09", "day"), (1, "02", "month"), (2, "2001", "year")],
+        )
+
     def test_formats_birthday_as_iso_for_the_hidden_form_field(self):
         self.assertEqual(_birthday_iso(2001, 2, 9), "2001-02-09")
 
@@ -278,12 +373,21 @@ class BirthdayStateTests(unittest.TestCase):
             )
         )
 
-    def test_retries_hidden_sync_after_react_aria_attempt_leaves_stale_hidden_value(self):
-        self.assertTrue(
+    def test_does_not_promote_dom_only_hidden_sync_after_react_aria_attempt(self):
+        self.assertFalse(
             _should_retry_birthday_hidden_sync(
                 has_attempt=True,
                 submission_ready=False,
                 react_aria_attempted=True,
+            )
+        )
+
+    def test_retries_hidden_sync_for_non_react_birthday_control(self):
+        self.assertTrue(
+            _should_retry_birthday_hidden_sync(
+                has_attempt=True,
+                submission_ready=False,
+                react_aria_attempted=False,
             )
         )
 
@@ -425,6 +529,266 @@ class ReactAriaBirthdayFillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["spinValues"], ["17", "12", "1995"])
         self.assertEqual(page.segments[0].typed_values, [])
 
+    async def test_corrupt_year_uses_direct_entry_instead_of_unbounded_arrows(self):
+        class FakeSegment:
+            def __init__(self, page, label, value):
+                self.page = page
+                self.label = label
+                self.value = int(value)
+                self.arrow_presses = 0
+                self.typed_values = []
+
+            async def get_attribute(self, name):
+                if name == "aria-label":
+                    return self.label
+                if name == "aria-valuenow":
+                    return str(self.value)
+                return ""
+
+            async def inner_text(self):
+                return f"{self.value:04d}" if "year" in self.label else f"{self.value:02d}"
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+            async def press(self, key):
+                if key in ("ArrowUp", "ArrowDown"):
+                    self.arrow_presses += 1
+                    self.value += 1 if key == "ArrowUp" else -1
+                    self.page.sync_hidden()
+                elif key == "Tab":
+                    self.page.sync_hidden()
+
+            async def press_sequentially(self, value, delay=0):
+                self.typed_values.append(value)
+                self.value = int(value)
+                self.page.sync_hidden()
+
+            async def fill(self, value):
+                await self.press_sequentially(value)
+
+        class FakeSpinLocator:
+            def __init__(self, segments):
+                self.segments = segments
+
+            async def count(self):
+                return len(self.segments)
+
+            def nth(self, index):
+                return self.segments[index]
+
+        class FakeNameLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+        class FakePage:
+            def __init__(self):
+                self.segments = [
+                    FakeSegment(self, "day, ", 28),
+                    FakeSegment(self, "month, ", 8),
+                    FakeSegment(self, "year, ", 371),
+                ]
+                self.hidden = "0371-08-28"
+
+            def locator(self, selector):
+                if selector == '[role="spinbutton"]':
+                    return FakeSpinLocator(self.segments)
+                if selector == 'input[name="name"]':
+                    return FakeNameLocator()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+            def sync_hidden(self):
+                day, month, year = (segment.value for segment in self.segments)
+                self.hidden = f"{year:04d}-{month:02d}-{day:02d}"
+
+            async def evaluate(self, _script):
+                return {
+                    "hiddenPresent": True,
+                    "hiddenValue": self.hidden,
+                    "spinValues": [
+                        f"{self.segments[0].value:02d}",
+                        f"{self.segments[1].value:02d}",
+                        f"{self.segments[2].value:04d}",
+                    ],
+                }
+
+        page = FakePage()
+        state = await _fill_react_aria_datefield(page, "1993-12-17", month=12, day=17, year=1993)
+
+        self.assertTrue(state["ready"])
+        self.assertLessEqual(
+            page.segments[2].arrow_presses,
+            BIRTHDAY_ARROW_ADJUSTMENT_LIMIT,
+        )
+        self.assertEqual(page.segments[2].typed_values, ["1993"])
+
+
+class AboutYouReactAriaPriorityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_react_aria_datefield_skips_legacy_global_keyboard_path(self):
+        class FakeSegment:
+            def __init__(self, page, label, value):
+                self.page = page
+                self.label = label
+                self.value = int(value)
+                self.arrow_presses = 0
+                self.typed_values = []
+
+            async def get_attribute(self, name):
+                if name == "aria-label":
+                    return self.label
+                if name == "aria-valuenow":
+                    return str(self.value)
+                return ""
+
+            async def inner_text(self):
+                return f"{self.value:04d}" if "year" in self.label else f"{self.value:02d}"
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+            async def press(self, key):
+                if key == "ArrowUp":
+                    self.arrow_presses += 1
+                    self.value += 1
+                elif key == "ArrowDown":
+                    self.arrow_presses += 1
+                    self.value -= 1
+                if key in ("ArrowUp", "ArrowDown", "Tab"):
+                    self.page.sync_hidden()
+
+            async def press_sequentially(self, value, delay=0):
+                self.typed_values.append(value)
+                self.value = int(value)
+                self.page.sync_hidden()
+
+            async def fill(self, value):
+                await self.press_sequentially(value)
+
+        class FakeLocator:
+            def __init__(self, page, selector):
+                self.page = page
+                self.selector = selector
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                if self.selector == '[role="spinbutton"]':
+                    return len(self.page.segments)
+                if self.selector == 'input[name="name"]':
+                    return 1
+                return 0
+
+            def nth(self, index):
+                if self.selector == '[role="spinbutton"]':
+                    return self.page.segments[index]
+                return self
+
+            async def is_visible(self):
+                return self.selector in ('[role="spinbutton"]', 'input[name="name"]')
+
+            async def evaluate(self, _script):
+                if self.selector == 'input[name="name"]':
+                    return {"type": "text", "name": "name", "value": ""}
+                raise AssertionError(f"unexpected locator evaluate: {self.selector}")
+
+            async def fill(self, value):
+                if self.selector == 'input[name="name"]':
+                    self.page.name = value
+                    return
+                raise AssertionError(f"unexpected locator fill: {self.selector}")
+
+            async def click(self, **_kwargs):
+                return None
+
+            async def all(self):
+                return []
+
+        class FakePage:
+            def __init__(self):
+                self.name = ""
+                self.segments = [
+                    FakeSegment(self, "day, ", 28),
+                    FakeSegment(self, "month, ", 8),
+                    FakeSegment(self, "year, ", 371),
+                ]
+                self.hidden = "0371-08-28"
+                self.keyboard_accessed = False
+
+            @property
+            def keyboard(self):
+                self.keyboard_accessed = True
+                raise AssertionError("legacy global keyboard path was used")
+
+            def locator(self, selector):
+                return FakeLocator(self, selector)
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+            def sync_hidden(self):
+                day, month, year = (segment.value for segment in self.segments)
+                self.hidden = f"{year:04d}-{month:02d}-{day:02d}"
+
+            async def evaluate(self, script, *args):
+                if "const inputs" in script and "const spins" in script:
+                    return {"inputs": [], "spins": [], "selects": [], "groups": [], "body": ""}
+                if "hiddenPresent" in script:
+                    return {
+                        "hiddenPresent": True,
+                        "hiddenValue": self.hidden,
+                        "spinValues": [
+                            f"{self.segments[0].value:02d}",
+                            f"{self.segments[1].value:02d}",
+                            f"{self.segments[2].value:04d}",
+                        ],
+                    }
+                if "querySelectorAll('input')" in script:
+                    expected = args[0] if args else ""
+                    if isinstance(expected, list):
+                        return False
+                    return expected == self.hidden
+                if "querySelectorAll('[role=\"spinbutton\"]')" in script:
+                    return "/".join(
+                        f"{segment.value:02d}" if "year" not in segment.label else f"{segment.value:04d}"
+                        for segment in self.segments
+                    )
+                if "checkbox" in script:
+                    return 0
+                raise AssertionError(f"unexpected page evaluate: {script[:120]}")
+
+        page = FakePage()
+        registrator = Registrator(object())
+        with patch("app.services.registrator.human_mouse_move", new=AsyncMock()), patch(
+            "app.services.registrator.random_pace", new=AsyncMock()
+        ):
+            await registrator._fill_about_you_form(page, "Alex Smith")
+
+        self.assertFalse(page.keyboard_accessed)
+        self.assertLessEqual(page.segments[2].arrow_presses, BIRTHDAY_ARROW_ADJUSTMENT_LIMIT)
+        self.assertEqual(len(page.segments[2].typed_values), 1)
+        self.assertTrue(1991 <= page.segments[2].value <= 2001)
+
 
 class PasswordFillRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_refreshes_once_when_password_value_does_not_stick(self):
@@ -565,6 +929,114 @@ class CodeFillRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await registrator_module.fill_code_with_reload(page, "123456", max_reloads=3))
         self.assertEqual(page.reload_calls, 1)
 
+    async def test_recovers_when_code_reload_lands_on_set_password(self):
+        from app.services import registrator as registrator_module
+
+        class FakeLocator:
+            def __init__(self, page, kind):
+                self.page = page
+                self.kind = kind
+                self.value = ""
+                self.clicks = 0
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def is_visible(self):
+                return True
+
+            async def fill(self, value):
+                if self.kind == "code" and self.page.phase == registrator_module.PHASE_EMAIL_VERIFICATION:
+                    if self.page.code_attempts == 0:
+                        self.page.code_attempts += 1
+                        raise TimeoutError("code input became unavailable")
+                    self.value = value
+                    return
+                self.value = value
+
+            async def input_value(self):
+                return self.value
+
+            async def evaluate(self, _script, *args):
+                if args:
+                    self.value = args[0]
+                return self.value
+
+            async def click(self, **_kwargs):
+                self.clicks += 1
+                if self.kind == "submit" and self.page.phase == registrator_module.PHASE_SET_PASSWORD:
+                    self.page.phase = registrator_module.PHASE_EMAIL_VERIFICATION
+
+        class FakePage:
+            def __init__(self):
+                self.phase = registrator_module.PHASE_EMAIL_VERIFICATION
+                self.reload_calls = 0
+                self.code_attempts = 0
+                self.code = FakeLocator(self, "code")
+                self.password = FakeLocator(self, "password")
+                self.submit = FakeLocator(self, "submit")
+
+            @property
+            def url(self):
+                if self.phase == registrator_module.PHASE_SET_PASSWORD:
+                    return "https://auth.openai.com/create-account/password"
+                return "https://auth.openai.com/email-verification"
+
+            def locator(self, selector):
+                if "password" in selector:
+                    return self.password
+                if 'button[type="submit"]' in selector:
+                    return self.submit
+                return self.code
+
+            async def reload(self, **_kwargs):
+                self.reload_calls += 1
+                self.phase = registrator_module.PHASE_SET_PASSWORD
+
+            async def wait_for_timeout(self, _ms):
+                return None
+
+        page = FakePage()
+
+        async def fake_wait_for_any_phase(page_arg, expected_set, *_args, **_kwargs):
+            self.assertIs(page_arg, page)
+            if page.phase in expected_set:
+                return {"phase": page.phase, "url": page.url}
+            raise AssertionError(f"unexpected phase {page.phase}")
+
+        async def fake_wait_for_phase(page_arg, expected, *_args, **_kwargs):
+            self.assertIs(page_arg, page)
+            self.assertEqual(expected, registrator_module.PHASE_EMAIL_VERIFICATION)
+            if page.phase == expected:
+                return {"phase": page.phase, "url": page.url}
+            raise AssertionError(f"unexpected phase {page.phase}")
+
+        with (
+            patch.object(registrator_module, "pick_visible", new=AsyncMock(side_effect=lambda locator, **_kwargs: locator)),
+            patch.object(registrator_module, "human_mouse_move", new=AsyncMock()),
+            patch.object(registrator_module, "random_pace", new=AsyncMock()),
+            patch.object(registrator_module, "wait_spa_ready", new=AsyncMock()),
+            patch.object(registrator_module, "wait_for_any_phase", new=AsyncMock(side_effect=fake_wait_for_any_phase)),
+            patch.object(registrator_module, "wait_for_phase", new=AsyncMock(side_effect=fake_wait_for_phase)),
+        ):
+            self.assertTrue(
+                await registrator_module.fill_code_with_reload(
+                    page,
+                    "123456",
+                    max_reloads=3,
+                    password="pw-123",
+                )
+            )
+
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.password.value, "pw-123")
+        self.assertEqual(page.submit.clicks, 1)
+        self.assertEqual(page.code.value, "123456")
+
     async def test_stops_after_three_code_fill_reloads(self):
         from app.services import registrator as registrator_module
 
@@ -616,6 +1088,10 @@ class PhoneNumberTests(unittest.TestCase):
     def test_email_submit_failure_has_a_non_consuming_gmail_marker(self):
         error = EmailSubmitNotConsumedError("邮箱提交动作未完成")
         self.assertEqual(error.non_consuming_reason, "email_submit_not_completed")
+
+    def test_email_post_submit_stuck_has_a_non_consuming_gmail_marker(self):
+        error = EmailPostSubmitNotConsumedError("邮箱提交后未跳转验证页")
+        self.assertEqual(error.non_consuming_reason, "email_post_submit_not_consumed")
 
     def test_about_you_finish_wait_budget_is_sixty_seconds(self):
         self.assertEqual(ABOUT_YOU_FINISH_TIMEOUT_SECONDS, 60)
@@ -756,6 +1232,81 @@ class PhoneNumberTests(unittest.TestCase):
 
         self.assertEqual(parsed["secret"], "IFBEGRCFIZDUQSKK")
         self.assertEqual(parsed["session_id"], "sess_xyz")
+
+
+class PasswordOrCodeEntryGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_email_verification_without_actionable_inputs_is_non_consuming_failure(self):
+        from app.services import registrator as registrator_module
+
+        class FakeLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 0
+
+            async def is_visible(self, *args, **kwargs):
+                return False
+
+        class FakePage:
+            url = "https://auth.openai.com/email-verification"
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        with patch.object(
+            registrator_module,
+            "probe_page",
+            new=AsyncMock(
+                return_value={
+                    "phase": registrator_module.PHASE_EMAIL_VERIFICATION,
+                    "url": "https://auth.openai.com/email-verification",
+                }
+            ),
+        ):
+            with self.assertRaises(EmailPostSubmitNotConsumedError):
+                await wait_for_password_or_code_entry(FakePage(), timeout_s=0.01, interval=0)
+
+    async def test_email_verification_waits_until_password_input_is_actionable(self):
+        from app.services import registrator as registrator_module
+
+        class FakeLocator:
+            def __init__(self, visible=False):
+                self.visible = visible
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1 if self.visible else 0
+
+            async def is_visible(self, *args, **kwargs):
+                return self.visible
+
+        class FakePage:
+            url = "https://auth.openai.com/create-account/password"
+
+            def locator(self, selector):
+                if "password" in selector:
+                    return FakeLocator(True)
+                return FakeLocator(False)
+
+        with patch.object(
+            registrator_module,
+            "probe_page",
+            new=AsyncMock(
+                return_value={
+                    "phase": registrator_module.PHASE_EMAIL_VERIFICATION,
+                    "url": "https://auth.openai.com/create-account/password",
+                }
+            ),
+        ):
+            state = await wait_for_password_or_code_entry(FakePage(), timeout_s=1, interval=0)
+
+        self.assertEqual(state["phase"], registrator_module.PHASE_SET_PASSWORD)
+
 
 class CallbackListenerTests(unittest.IsolatedAsyncioTestCase):
     async def test_listener_returns_only_a_valid_callback_code(self):

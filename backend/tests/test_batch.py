@@ -62,7 +62,7 @@ def test_gmail_registration_finishes_primary_order_only_on_consuming_final_round
         result_json=json.dumps({
             "gmail_alias_counter": 3,
             "gmail_exhausted_after_alias": True,
-            "gmail_non_consuming_failure": "google_login_page",
+            "gmail_non_consuming_failure": "email_post_submit_not_consumed",
         }),
     )
     middle_round = Registration(
@@ -78,8 +78,8 @@ def test_gmail_registration_finishes_primary_order_only_on_consuming_final_round
     assert gmail_registration_finishes_order(middle_round) is False
 
 
-@pytest.mark.parametrize("reason", ["google_login_page", "email_submit_not_completed"])
-def test_pre_verification_gmail_failure_is_not_counted_and_extends_alias_quota(reason):
+@pytest.mark.parametrize("reason", ["google_login_page", "email_submit_not_completed", "email_post_submit_not_consumed"])
+def test_pre_verification_gmail_failure_is_not_counted_and_extends_next_alias_quota(reason):
     db = _db_session()
     from app.models import GmailSession, Registration
 
@@ -98,6 +98,7 @@ def test_pre_verification_gmail_failure_is_not_counted_and_extends_alias_quota(r
         gmail_alias="first@gmail.com",
         result_json=json.dumps({
             "gmail_session_id": session.id,
+            "gmail_alias_counter": 3,
             "gmail_max_aliases": 3,
             "gmail_non_consuming_failure": reason,
             "gmail_quota_extension_applied": False,
@@ -109,8 +110,10 @@ def test_pre_verification_gmail_failure_is_not_counted_and_extends_alias_quota(r
     assert BatchCoordinator._restore_pre_verification_gmail_quota(db, reg) is True
     assert BatchCoordinator._restore_pre_verification_gmail_quota(db, reg) is False
     db.commit()
-    assert db.get(GmailSession, session.id).max_aliases == 4
-    assert db.get(GmailSession, session.id).status == "active"
+    restored = db.get(GmailSession, session.id)
+    assert restored.alias_counter == 3
+    assert restored.max_aliases == 4
+    assert restored.status == "active"
 
 
 def test_format_gmail_registration_logs_includes_order_address_round_and_remaining():
@@ -319,6 +322,57 @@ def test_get_batch_logs_returns_incremental_persisted_lines():
     assert result["logs"] == [{"seq": 2, "ts": "10:00:01", "msg": "[gmail] alias 已获取"}]
     assert result["next"] == 2
     assert result["total"] == 2
+
+
+def test_get_batch_logs_paginates_forward_without_skipping_backlog():
+    db = _db_session()
+    batch = Batch(
+        status="running",
+        logs_json=json.dumps([
+            {"seq": seq, "ts": "10:00:00", "msg": f"batch-line-{seq}"}
+            for seq in range(1, 701)
+        ]),
+    )
+    db.add(batch)
+    db.commit()
+
+    first = batches.get_batch_logs(batch.id, after=0, limit=300, db=db)
+    second = batches.get_batch_logs(batch.id, after=first["next"], limit=300, db=db)
+    third = batches.get_batch_logs(batch.id, after=second["next"], limit=300, db=db)
+
+    assert [line["seq"] for line in first["logs"][:3]] == [1, 2, 3]
+    assert first["next"] == 300
+    assert [line["seq"] for line in second["logs"][:3]] == [301, 302, 303]
+    assert second["next"] == 600
+    assert [line["seq"] for line in third["logs"]] == list(range(601, 701))
+    assert third["next"] == 700
+
+
+def test_batch_append_log_preserves_full_history(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    batch = Batch(status="running")
+    db.add(batch)
+    db.commit()
+    batch_id = batch.id
+    db.close()
+
+    monkeypatch.setattr(batch_service, "SessionLocal", Session)
+    coordinator = BatchCoordinator(None)
+
+    for seq in range(1, 606):
+        coordinator._append_log(batch_id, f"batch noisy line {seq}")
+
+    check = Session()
+    try:
+        saved = json.loads(check.get(Batch, batch_id).logs_json)
+        assert len(saved) == 605
+        assert saved[0]["msg"] == "batch noisy line 1"
+        assert saved[-1]["msg"] == "batch noisy line 605"
+    finally:
+        check.close()
 
 
 def test_clear_batch_logs_removes_persisted_lines_without_deleting_batch(monkeypatch):

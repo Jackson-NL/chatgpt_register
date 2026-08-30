@@ -12,7 +12,8 @@ from ..db import SessionLocal
 from ..models import Account, GmailSession, Registration, utcnow
 from .registrator import (
     GmailPreVerificationNotConsumedError, Registrator, VerificationTimeoutError,
-    clear_log_sink, gen_password, reset_log_source, set_log_sink, set_log_source,
+    clear_log_sink, gen_password, reset_log_source, reset_log_target,
+    set_log_sink, set_log_source, set_log_target,
 )
 from .browser_stack import make_profile_path
 from .profile_lifecycle import remove_profile_tree
@@ -22,7 +23,9 @@ from .smsbower_mail import SmsbowerMailClient
 
 _JOBS: dict[int, asyncio.Task] = {}
 _DB_LOCK_RETRY_DELAYS = (0.2, 0.5, 1.0)
-MAX_LOG_LINES = 500
+# 注册任务日志必须完整保留；前端负责限制渲染行数，后端分页负责限制单次响应体积。
+# 旧版本在任务结束时只保留最后 500 行，会导致长任务/抓包调试无法复盘早期阶段。
+MAX_LOG_LINES = 0
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_.\-]{20,}")
 _TOTP_RE = re.compile(r"\b[A-Z2-7]{32}\b")
 
@@ -201,7 +204,7 @@ class RegistrationService:
         return lines
 
     def get_logs(self, reg_id: int, after: int = 0, limit: int = 200) -> dict:
-        """增量读取该任务日志：优先内存缓冲，任务结束后从 DB logs_json 回放。"""
+        """增量读取该任务日志：按 seq 正向分页，避免长时间未轮询时跳过中间日志。"""
         lines = self._log_buffers.get(reg_id)
         if lines is None:
             db = SessionLocal()
@@ -212,10 +215,20 @@ class RegistrationService:
                 lines = []
             finally:
                 db.close()
-        out = [x for x in lines if x["seq"] > after]
-        if limit > 0:
-            out = out[-limit:]
-        return {"logs": out, "next": lines[-1]["seq"] if lines else after, "total": len(lines)}
+        safe_after = max(0, int(after or 0))
+        out = [x for x in lines if int(x.get("seq", 0)) > safe_after]
+        safe_limit = max(0, int(limit or 0))
+        if safe_limit > 0:
+            out = out[:safe_limit]
+        latest_seq = int(lines[-1].get("seq", safe_after)) if lines else safe_after
+        next_seq = int(out[-1].get("seq", safe_after)) if out else latest_seq
+        return {
+            "logs": out,
+            "next": next_seq,
+            "latest": latest_seq,
+            "has_more": bool(out and next_seq < latest_seq),
+            "total": len(lines),
+        }
 
     def clear_logs(self, reg_id: int) -> bool:
         """清空单个注册任务的内存与持久化日志，不删除注册记录。"""
@@ -280,11 +293,13 @@ class RegistrationService:
         profile_path = ""
         profile_persisted = False
         src_token = None
+        target_token = None
         if manage_log_context:
             set_log_sink(reg_id, lines)
             # 标记本任务日志来源为 register，使 emit_log 只写入本任务的 sink（落库），
             # 不再写入 OAuth 全局缓冲，从而实现与 Codex OAuth 的日志隔离。
             src_token = set_log_source("register")
+            target_token = set_log_target(reg_id)
         try:
             reg = db.get(Registration, reg_id)
             if not reg:
@@ -470,7 +485,7 @@ class RegistrationService:
                     remove_profile_tree(profile_path)
                 except (OSError, ValueError):
                     pass
-            if len(lines) > MAX_LOG_LINES:
+            if MAX_LOG_LINES > 0 and len(lines) > MAX_LOG_LINES:
                 lines[:] = lines[-MAX_LOG_LINES:]
             # 持久化日志（任务结束后可从 DB 回放）
             try:
@@ -495,6 +510,8 @@ class RegistrationService:
                 clear_log_sink(reg_id)
                 if src_token is not None:
                     reset_log_source(src_token)
+                if target_token is not None:
+                    reset_log_target(target_token)
             _JOBS.pop(reg_id, None)
 
     async def submit(self, proxy: str = "", headless: bool = True, bind_totp: bool = True, batch_id: int | None = None,
@@ -528,6 +545,7 @@ class RegistrationService:
                 lines = self._ensure_log_buffer(reg_id)
                 set_log_sink(reg_id, lines)
                 src_token = set_log_source("register")
+                target_token = set_log_target(reg_id)
                 try:
                     gmail_mode = False
                     proxy = ""
@@ -547,11 +565,21 @@ class RegistrationService:
                 finally:
                     clear_log_sink(reg_id)
                     reset_log_source(src_token)
+                    reset_log_target(target_token)
                     self._active -= 1
 
         _JOBS[reg_id] = asyncio.get_running_loop().create_task(_guarded())
         from .registrator import emit_log
-        emit_log(f"[registration:{reg_id}] 已入队")
+        lines = self._ensure_log_buffer(reg_id)
+        set_log_sink(reg_id, lines)
+        src_token = set_log_source("register")
+        target_token = set_log_target(reg_id)
+        try:
+            emit_log(f"[registration:{reg_id}] 已入队")
+        finally:
+            clear_log_sink(reg_id)
+            reset_log_target(target_token)
+            reset_log_source(src_token)
         return reg_id
 
     def cancel_registration(self, reg_id: int) -> bool:

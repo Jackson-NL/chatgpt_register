@@ -12,7 +12,8 @@ from .registrations import RegistrationService
 
 _JOBS: dict[int, asyncio.Task] = {}
 _START_LOCK = asyncio.Lock()
-MAX_BATCH_LOG_LINES = 500
+# 批量/Gmail 准备日志也必须完整保留；前端限制渲染，API 正向分页限制响应体积。
+MAX_BATCH_LOG_LINES = 0
 
 
 def normalize_batch_concurrency(requested: int, service_capacity: int, gmail_mode: bool = False) -> int:
@@ -113,7 +114,7 @@ class BatchCoordinator:
                                 self._append_log(
                                     batch_id,
                                     f"[gmail] reg_{reg.id} 在邮箱验证前失败；"
-                                    "不计入批量尝试，已追加一个别名轮次",
+                                    "不计入批量尝试，已补回后续 Gmail 名额并跳过当前地址",
                                 )
                             else:
                                 batch.failed += 1
@@ -252,7 +253,9 @@ class BatchCoordinator:
                 "ts": utcnow().strftime("%H:%M:%S"),
                 "msg": line_message,
             })
-            batch.logs_json = json.dumps(lines[-MAX_BATCH_LOG_LINES:], ensure_ascii=False)
+            if MAX_BATCH_LOG_LINES > 0:
+                lines = lines[-MAX_BATCH_LOG_LINES:]
+            batch.logs_json = json.dumps(lines, ensure_ascii=False)
             db.commit()
         finally:
             db.close()
@@ -286,6 +289,7 @@ class BatchCoordinator:
         if (
             draft.get("gmail_non_consuming_failure") not in {
                 "email_submit_not_completed",
+                "email_post_submit_not_consumed",
                 "google_login_page",
             }
             or draft.get("gmail_quota_extension_applied")
@@ -300,10 +304,12 @@ class BatchCoordinator:
             db,
             int(session_id),
             int(draft.get("gmail_max_aliases") or 0),
+            allocated_alias_counter=int(draft.get("gmail_alias_counter") or 0),
         )
         if not session:
             return False
         draft["gmail_quota_extension_applied"] = True
+        draft["gmail_alias_counter_after_restore"] = session.alias_counter
         draft["gmail_max_aliases_after_extension"] = session.max_aliases
         reg.result_json = json.dumps(draft, ensure_ascii=False)
         return True
@@ -335,6 +341,7 @@ def gmail_registration_finishes_order(reg: Registration) -> bool:
         return False
     if draft.get("gmail_non_consuming_failure") in {
         "email_submit_not_completed",
+        "email_post_submit_not_consumed",
         "google_login_page",
     }:
         return False

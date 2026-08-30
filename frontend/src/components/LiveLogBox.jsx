@@ -11,6 +11,10 @@ const LEVEL_OPTIONS = [
   { value: "warning", label: "警告" },
   { value: "error", label: "错误" },
 ];
+const LIVE_LOG_RENDER_LIMIT = 2000;
+const INITIAL_LOG_FETCH_LIMIT = 500;
+const POLL_LOG_FETCH_LIMIT = 300;
+const MAX_BACKLOG_PAGES_PER_TICK = 5;
 
 /**
  * 实时日志框：深色终端风格，轮询 registration 和 batch 两类日志增量拉取。
@@ -69,11 +73,22 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
   };
 
   const apply = useCallback((res, source = "reg") => {
+    const nextCursor = Number(res?.next ?? 0) || 0;
+    if (source === "batch") setBatchNext((current) => Math.max(current, nextCursor));
+    else setNext((current) => Math.max(current, nextCursor));
     if (res?.logs?.length) {
       const tagged = res.logs.map((line) => ({ ...line, source, _key: `${source}-${line.seq}` }));
-      setLogs((prev) => [...prev, ...tagged]);
-      if (source === "batch") setBatchNext(res.next ?? 0);
-      else setNext(res.next ?? 0);
+      setLogs((prev) => {
+        const seen = new Set(prev.map((line) => line._key || `${line.source || source}-${line.seq}`));
+        const merged = [...prev];
+        tagged.forEach((line) => {
+          if (!seen.has(line._key)) {
+            seen.add(line._key);
+            merged.push(line);
+          }
+        });
+        return merged;
+      });
       onLogsRef.current?.(tagged);
     }
   }, []);
@@ -87,18 +102,30 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
     if (!regId && !batchId) return undefined;
     let alive = true;
 
-    const fetchOnce = async (source, after) => {
+    const fetchOnce = async (source, after, limit) => {
       try {
         const res = source === "batch"
-          ? await api.batches.logs(batchId, { after, limit: 500 })
-          : await api.registrations.logs(regId, { after, limit: 500 });
+          ? await api.batches.logs(batchId, { after, limit })
+          : await api.registrations.logs(regId, { after, limit });
         if (alive) apply(res, source);
+        return res;
       } catch { /* 网络抖动忽略 */ }
+      return null;
     };
 
-    // 首次全量
-    if (regId) fetchOnce("reg", 0);
-    if (batchId) fetchOnce("batch", 0);
+    const drainBacklog = async (source, after, limit, maxPages = MAX_BACKLOG_PAGES_PER_TICK) => {
+      let cursor = Number(after || 0) || 0;
+      for (let page = 0; alive && page < maxPages; page += 1) {
+        const res = await fetchOnce(source, cursor, limit);
+        if (!res?.logs?.length) break;
+        cursor = Number(res.next ?? cursor) || cursor;
+        if (!res.has_more || limit <= 0) break;
+      }
+    };
+
+    // 首次拉取：运行中分批补齐积压；已结束任务直接拉全量，避免只显示前/后 500 行。
+    if (regId) drainBacklog("reg", 0, active ? INITIAL_LOG_FETCH_LIMIT : 0, active ? MAX_BACKLOG_PAGES_PER_TICK : 1);
+    if (batchId) drainBacklog("batch", 0, active ? INITIAL_LOG_FETCH_LIMIT : 0, active ? MAX_BACKLOG_PAGES_PER_TICK : 1);
     if (!active) return () => { alive = false; };
 
     const timer = setInterval(async () => {
@@ -106,13 +133,13 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
       // 两个游标独立推进，避免 Gmail 准备阶段没有 reg_id 时丢失批量日志。
       if (regId) {
         setNext((n) => {
-          api.registrations.logs(regId, { after: n, limit: 300 }).then((res) => { if (alive) apply(res, "reg"); }).catch(() => {});
+          drainBacklog("reg", n, POLL_LOG_FETCH_LIMIT);
           return n;
         });
       }
       if (batchId) {
         setBatchNext((n) => {
-          api.batches.logs(batchId, { after: n, limit: 300 }).then((res) => { if (alive) apply(res, "batch"); }).catch(() => {});
+          drainBacklog("batch", n, POLL_LOG_FETCH_LIMIT);
           return n;
         });
       }
@@ -141,8 +168,32 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
     } catch { return false; }
   };
 
+  const loadCompleteLogs = async () => {
+    const complete = [];
+    const requests = [];
+    if (batchId) requests.push(api.batches.logs(batchId, { after: 0, limit: 0 }).then((res) => ["batch", res]));
+    if (regId) requests.push(api.registrations.logs(regId, { after: 0, limit: 0 }).then((res) => ["reg", res]));
+    try {
+      const results = await Promise.all(requests);
+      results.forEach(([source, res]) => {
+        if (Array.isArray(res?.logs)) {
+          complete.push(...res.logs.map((line) => ({ ...line, source, _key: `${source}-${line.seq}` })));
+        }
+      });
+    } catch {
+      return logs;
+    }
+    return complete.length ? complete : logs;
+  };
+
+  const formatLogText = (items) => {
+    const mixedSources = new Set(items.map((line) => line.source).filter(Boolean)).size > 1;
+    return items.map((l) => `${l.ts} ${mixedSources ? `[${l.source}] ` : ""}${l.msg}`).join("\n");
+  };
+
   const copyLogs = async () => {
-    const text = logs.map((l) => `${l.ts} ${l.msg}`).join("\n");
+    const completeLogs = await loadCompleteLogs();
+    const text = formatLogText(completeLogs);
     if (await copyText(text)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
@@ -157,13 +208,15 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
   };
 
   const downloadLogs = () => {
-    const text = logs.map((l) => `${l.ts} ${l.msg}`).join("\n");
-    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${batchId ? `batch_${batchId}` : `reg_${regId}`}_log_${Date.now().toString().slice(-6)}.log`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    loadCompleteLogs().then((completeLogs) => {
+      const text = formatLogText(completeLogs);
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${batchId ? `batch_${batchId}` : `reg_${regId}`}_log_${Date.now().toString().slice(-6)}.log`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
   };
 
   const clearLogs = async () => {
@@ -189,6 +242,8 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
   };
 
   const visibleLogs = filterLogLines(logs, filter);
+  const renderedLogs = visibleLogs.slice(-LIVE_LOG_RENDER_LIMIT);
+  const hiddenLogCount = Math.max(0, visibleLogs.length - renderedLogs.length);
   const levelCounts = { success: 0, warning: 0, error: 0, info: 0 };
   logs.forEach((l) => { levelCounts[normalizeLogLevel(l.msg)] += 1; });
 
@@ -290,7 +345,12 @@ export default function LiveLogBox({ regId, batchId, active, height = 320, title
             {t(`当前级别下暂无日志（共 ${logs.length} 行）`)}
           </div>
         )}
-        {visibleLogs.map((l) => {
+        {hiddenLogCount > 0 && (
+          <div className="sticky top-0 z-10 mb-1 rounded border border-slate-700 bg-slate-900/95 px-2 py-1 text-[11px] text-slate-400">
+            已隐藏较早 {hiddenLogCount} 行，仅渲染最近 {renderedLogs.length} 行；复制/下载会从后端拉取完整日志。
+          </div>
+        )}
+        {renderedLogs.map((l) => {
           const lv = normalizeLogLevel(l.msg);
           const meta = LOG_LEVEL_META[lv];
           const isCopied = copiedLine === (l._key || l.seq);

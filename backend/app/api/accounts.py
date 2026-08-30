@@ -653,6 +653,50 @@ def list_oauth_log_history(after: int = 0, limit: int = 200, q: str = ""):
 
 _OAUTH_JOBS: dict[str, dict] = {}
 _ACTIVE_OAUTH_JOB_ID: str | None = None
+_OAUTH_TERMINAL_STATUSES = {"success", "failed", "stopped", "canceled", "cancelled"}
+
+
+def _parse_job_finished_at(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prune_oauth_jobs(now: datetime | None = None) -> int:
+    """Bound in-memory OAuth job history while preserving active jobs."""
+    current = now or datetime.now(timezone.utc)
+    ttl = max(60, int(getattr(settings, "oauth_job_ttl_seconds", 6 * 60 * 60) or 6 * 60 * 60))
+    max_history = max(1, int(getattr(settings, "oauth_job_max_history", 100) or 100))
+    removed = 0
+
+    for job_id, job in list(_OAUTH_JOBS.items()):
+        if job_id == _ACTIVE_OAUTH_JOB_ID:
+            continue
+        if str(job.get("status") or "") not in _OAUTH_TERMINAL_STATUSES:
+            continue
+        finished_at = _parse_job_finished_at(job.get("finished_at"))
+        if finished_at and (current - finished_at).total_seconds() > ttl:
+            _OAUTH_JOBS.pop(job_id, None)
+            removed += 1
+
+    terminal_jobs = [
+        (job_id, _parse_job_finished_at(job.get("finished_at")) or datetime.min.replace(tzinfo=timezone.utc))
+        for job_id, job in _OAUTH_JOBS.items()
+        if job_id != _ACTIVE_OAUTH_JOB_ID and str(job.get("status") or "") in _OAUTH_TERMINAL_STATUSES
+    ]
+    overflow = len(terminal_jobs) - max_history
+    if overflow > 0:
+        for job_id, _finished in sorted(terminal_jobs, key=lambda item: item[1])[:overflow]:
+            if _OAUTH_JOBS.pop(job_id, None) is not None:
+                removed += 1
+    return removed
 
 
 def _oauth_error_allows_phone_fallback(error: Exception) -> bool:
@@ -1020,12 +1064,14 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
         if _ACTIVE_OAUTH_JOB_ID == job_id:
             _ACTIVE_OAUTH_JOB_ID = None
+        _prune_oauth_jobs()
 
 
 @router.post("/oauth/jobs")
 async def create_codex_oauth_job(payload: CodexOAuthJobBody):
     """启动 Codex OAuth 后台任务；前端拿 job_id 后用 cancel 接口停止后端浏览器流程。"""
     global _ACTIVE_OAUTH_JOB_ID
+    _prune_oauth_jobs()
     if _ACTIVE_OAUTH_JOB_ID:
         active = _OAUTH_JOBS.get(_ACTIVE_OAUTH_JOB_ID)
         if active and active.get("status") in {"pending", "running", "stopping"}:
@@ -1077,6 +1123,7 @@ async def create_codex_oauth_job(payload: CodexOAuthJobBody):
 @router.get("/oauth/jobs/active")
 def get_active_codex_oauth_job():
     """返回当前仍在运行/停止中的 Codex OAuth 任务，用于页面重进后恢复停止按钮。"""
+    _prune_oauth_jobs()
     if not _ACTIVE_OAUTH_JOB_ID:
         return None
     return _oauth_job_snapshot(_OAUTH_JOBS.get(_ACTIVE_OAUTH_JOB_ID))
@@ -1084,6 +1131,7 @@ def get_active_codex_oauth_job():
 
 @router.get("/oauth/jobs/{job_id}")
 def get_codex_oauth_job(job_id: str):
+    _prune_oauth_jobs()
     job = _OAUTH_JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "OAuth job 不存在")

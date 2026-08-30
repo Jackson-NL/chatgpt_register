@@ -49,6 +49,17 @@ class Settings(BaseSettings):
     oauth_clash_selector_name: str = ""
     # OAuth 启动前的 Clash 轮换最多等待多久，避免任务永久停在准备阶段。
     oauth_clash_rotate_timeout_seconds: float = 30.0
+    # 长时间运行负载控制：OAuth 日志批量写库，避免每行日志创建线程和 SQLite 写事务。
+    oauth_log_flush_interval_seconds: float = 1.0
+    oauth_log_flush_batch_size: int = 50
+    # Codex OAuth 后台 job 只保留有限终态历史，防止内存字典无限增长。
+    oauth_job_ttl_seconds: int = 6 * 60 * 60
+    oauth_job_max_history: int = 100
+    # 浏览器/Playwright 孤儿进程 watchdog：只清理本项目 profiles 下的陈旧进程。
+    process_watchdog_enabled: bool = True
+    process_watchdog_interval_seconds: int = 5 * 60
+    browser_process_stale_minutes: int = 45
+    playwright_driver_stale_minutes: int = 45
 
     new_account_cooldown_minutes: int = 120
     registration_bind_totp: bool = False

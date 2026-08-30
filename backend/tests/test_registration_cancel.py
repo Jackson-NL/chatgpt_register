@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -369,6 +370,75 @@ def test_registration_clear_logs_removes_memory_and_persisted_lines(monkeypatch)
     check = Session()
     try:
         assert check.get(Registration, reg_id).logs_json == "[]"
+    finally:
+        check.close()
+
+
+def test_registration_logs_paginate_forward_without_skipping_backlog(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    lines = [{"seq": seq, "ts": "10:00:00", "msg": f"line-{seq}"} for seq in range(1, 701)]
+    reg = Registration(status="completed", logs_json=json.dumps(lines))
+    db.add(reg)
+    db.commit()
+    reg_id = reg.id
+    db.close()
+
+    monkeypatch.setattr(registration_service, "SessionLocal", Session)
+    service = RegistrationService()
+
+    first = service.get_logs(reg_id, after=0, limit=300)
+    second = service.get_logs(reg_id, after=first["next"], limit=300)
+    third = service.get_logs(reg_id, after=second["next"], limit=300)
+
+    assert [line["seq"] for line in first["logs"][:3]] == [1, 2, 3]
+    assert first["next"] == 300
+    assert [line["seq"] for line in second["logs"][:3]] == [301, 302, 303]
+    assert second["next"] == 600
+    assert [line["seq"] for line in third["logs"]] == list(range(601, 701))
+    assert third["next"] == 700
+
+
+def test_finished_registration_persists_full_log_history(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    reg = Registration(status="pending", proxy="http://127.0.0.1:7890")
+    db.add(reg)
+    db.commit()
+    reg_id = reg.id
+    db.close()
+
+    class NoisyFailingRegistrator:
+        def __init__(self, sms_client=None):
+            pass
+
+        async def register_by_email(self, **kwargs):
+            from app.services.registrator import RegisterError, emit_log
+
+            for seq in range(1, 606):
+                emit_log(f"[test] noisy registration line {seq}")
+            raise RegisterError("email", "forced failure after noisy logs")
+
+    monkeypatch.setattr(registration_service, "SessionLocal", Session)
+    monkeypatch.setattr(registration_service, "Registrator", NoisyFailingRegistrator)
+    monkeypatch.setattr(registration_service, "SmsbowerClient", lambda: object())
+    monkeypatch.setattr(registration_service, "make_profile_path", lambda name: f"D:/tmp/{name}")
+    monkeypatch.setattr(registration_service, "remove_profile_tree", lambda path: None)
+
+    asyncio.run(RegistrationService()._run(reg_id))
+
+    check = Session()
+    try:
+        refreshed = check.get(Registration, reg_id)
+        saved = json.loads(refreshed.logs_json)
+        assert refreshed.status == "failed"
+        assert len(saved) >= 606
+        assert any("noisy registration line 1" in line["msg"] for line in saved)
+        assert any("noisy registration line 605" in line["msg"] for line in saved)
     finally:
         check.close()
 

@@ -35,6 +35,11 @@ def _profile_lock_key(profile_path: str) -> str:
     return os.path.normcase(os.path.abspath(profile_path))
 
 
+def active_profile_paths() -> set[str]:
+    """Return normalized profile paths currently leased by this backend process."""
+    return {key for key, lock in _PROFILE_LOCKS.items() if lock.locked()}
+
+
 @asynccontextmanager
 async def profile_lease(profile_path: str):
     """Reserve a persistent Firefox profile for one browser task at a time."""

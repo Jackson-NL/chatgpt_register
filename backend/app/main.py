@@ -8,6 +8,7 @@ from .api.batches import init_batches
 from .config import settings
 from .db import init_db
 from .services.registrations import RegistrationService
+from .services.registrator import start_oauth_log_writer, stop_oauth_log_writer
 from .services.sub2api_relogin import Sub2APIReloginService
 
 
@@ -28,8 +29,23 @@ async def lifespan(app: FastAPI):
     link_extraction.SERVICE = link_extraction.LinkExtractionService()
     # 初始化批量注册协调器
     init_batches(service)
+    start_oauth_log_writer()
+    watchdog = None
+    if settings.process_watchdog_enabled:
+        try:
+            from .services.process_watchdog import ProcessWatchdog
+
+            watchdog = ProcessWatchdog()
+            watchdog.start()
+        except Exception:
+            watchdog = None
     app.state.registration_service = service
-    yield
+    try:
+        yield
+    finally:
+        if watchdog:
+            await watchdog.stop()
+        await stop_oauth_log_writer()
 
 
 def _cleanup_stale_registrations():

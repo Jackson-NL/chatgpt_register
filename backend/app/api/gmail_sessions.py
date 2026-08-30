@@ -219,15 +219,30 @@ def _alias_response(session: GmailSession, alias: str) -> dict:
     }
 
 
-def extend_for_pre_verification_failure(db: Session, session_id: int, allocated_max_aliases: int) -> GmailSession | None:
-    """给邮箱验证前失败的注册任务补回一个本地 alias 配额。"""
+def extend_for_pre_verification_failure(
+    db: Session,
+    session_id: int,
+    allocated_max_aliases: int,
+    allocated_alias_counter: int | None = None,
+) -> GmailSession | None:
+    """给邮箱验证前失败的注册任务补回一个后续 alias 配额。
+
+    关键点：不能回退 alias_counter，否则同一 Gmail 地址会被下一轮再次分配，
+    遇到 Google 登录页/提交无响应时会形成 reg_736/reg_737/reg_738 这种重复循环。
+    因此这里保留已分配 counter（跳过当前坏地址），只把 max_aliases 扩一位：
+    批量尝试计数不变、Gmail 可用总名额不减少、下一轮换后续地址继续。
+    """
     session = db.get(GmailSession, session_id)
     if not session:
         return None
-    # 每次明确未消耗验证码的失败都补一个名额；用当前计数而不是初始上限，
-    # 避免同一订单连续发生非消耗失败时第二次无法继续。
     current_max = session.max_aliases or DEFAULT_MAX_ALIASES
-    session.max_aliases = max(current_max, int(session.alias_counter or 0) + 1, int(allocated_max_aliases or 0) + 1)
+    allocated_counter = int(allocated_alias_counter or 0)
+    session.max_aliases = max(
+        current_max,
+        int(session.alias_counter or 0) + 1,
+        int(allocated_max_aliases or 0) + 1,
+        allocated_counter + 1,
+    )
     if session.status == "expired" and session.expired_reason == "达到最大验证码次数":
         session.status = "active"
         session.expired_reason = ""

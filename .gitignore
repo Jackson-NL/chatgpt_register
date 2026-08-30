@@ -4,6 +4,7 @@ __pycache__/
 backend/data/
 backend/profiles/*/
 backend/app.db
+backend/*.db
 frontend/node_modules/
 frontend/dist/
 
@@ -19,6 +20,11 @@ capture/
 
 # Output (verification diffs, logs)
 output/
+
+# Private one-off account maintenance scripts
+backend/scripts/backfill_rt.py
+backend/scripts/import_sub2api_*.py
+backend/scripts/relogin_*_accounts.py
 
 # Playwright CLI logs
 .playwright-cli/

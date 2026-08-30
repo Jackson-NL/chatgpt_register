@@ -43,7 +43,7 @@ def test_build_gmail_address_uses_alias_base_alias_sequence():
     assert re.fullmatch(r"first\+[a-z0-9]{8}@gmail\.com", fourth), fourth
 
 
-def test_pre_verification_failure_extends_alias_budget_and_reactivates_limit_only_expiry():
+def test_pre_verification_failure_extends_alias_budget_without_reusing_bad_address():
     db = _db_session()
     session = GmailSession(
         base_email="first@gmail.com",
@@ -56,9 +56,15 @@ def test_pre_verification_failure_extends_alias_budget_and_reactivates_limit_onl
     db.add(session)
     db.commit()
 
-    restored = gmail_sessions.extend_for_pre_verification_failure(db, session.id, allocated_max_aliases=3)
+    restored = gmail_sessions.extend_for_pre_verification_failure(
+        db,
+        session.id,
+        allocated_max_aliases=3,
+        allocated_alias_counter=3,
+    )
 
     assert restored is not None
+    assert restored.alias_counter == 3
     assert restored.max_aliases == 4
     assert restored.status == "active"
     assert restored.expired_reason == ""

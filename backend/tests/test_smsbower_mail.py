@@ -45,6 +45,34 @@ def test_request_handles_subprocess_start_error_without_unbound_json(monkeypatch
         raise AssertionError("expected SmsbowerMailError")
 
 
+def test_request_uses_default_proxy_for_mail_api(monkeypatch):
+    client = SmsbowerMailClient(api_key="test")
+    calls = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"status": 1, "data": []}', b""
+
+    async def fake_subprocess(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeProc()
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.smsbower_mail.settings.default_proxy", "http://127.0.0.1:7890")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    asyncio.run(client._request("getActivation"))
+
+    argv = list(calls[0][0])
+    assert "-x" in argv
+    assert argv[argv.index("-x") + 1] == "http://127.0.0.1:7890"
+
+
 def test_hidden_subprocess_kwargs_hide_windows_console():
     options = hidden_subprocess_kwargs()
 

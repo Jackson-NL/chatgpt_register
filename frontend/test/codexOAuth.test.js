@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_OAUTH_PARAMS,
+  MAX_PERSISTED_OAUTH_LOGS,
+  MAX_RENDERED_OAUTH_LOGS,
   OAUTH_COUNTRY_OPTIONS,
+  OAUTH_LOG_POLL_HIDDEN_MS,
+  OAUTH_LOG_POLL_VISIBLE_MS,
   OAUTH_RUNTIME_STORAGE_KEY,
   buildOAuthPayload,
   createOAuthRuntimeStore,
@@ -22,13 +26,19 @@ import {
   saveOAuthForm,
   summarizeOAuthAccounts,
   toggleOAuthCountry,
+  trimOAuthLogs,
   getOAuthTargets,
+  visibleOAuthLogs,
   projectOAuthResult,
   projectOAuthBackendLog,
   oauthBackendLogLevel,
   shouldFallbackToAutoPhone,
   shouldAutoScrollOAuthLogs,
+  shouldFollowOAuthLogTail,
   shouldPollOAuthBackendLogs,
+  shouldPollOAuthBackendLogsNow,
+  oauthBackendLogPollDelay,
+  oauthLogScrollSignal,
   codexOAuthConsoleLayout,
   isOAuthJobRunning,
   isOAuthJobMissingError,
@@ -305,6 +315,42 @@ test("Codex OAuth runtime store keeps logs across page remounts", () => {
   assert.equal(store.getSnapshot().running, true);
 });
 
+test("Codex OAuth runtime caps retained logs at the configured ceiling", () => {
+  const store = createOAuthRuntimeStore({}, {
+    getItem: () => null,
+    setItem: () => {},
+  });
+
+  for (let index = 0; index < MAX_PERSISTED_OAUTH_LOGS + 5; index += 1) {
+    store.appendLog({ id: `log-${index}`, time: "03:05:57", message: `line ${index}`, level: "info" });
+  }
+
+  const logs = store.getSnapshot().logs;
+  assert.equal(MAX_PERSISTED_OAUTH_LOGS, 800);
+  assert.equal(logs.length, 800);
+  assert.equal(logs[0].id, "log-5");
+  assert.equal(logs.at(-1).id, `log-${MAX_PERSISTED_OAUTH_LOGS + 4}`);
+});
+
+test("Codex OAuth log helpers trim state and render only the recent window", () => {
+  const logs = Array.from({ length: MAX_PERSISTED_OAUTH_LOGS + 50 }, (_, index) => ({
+    id: `log-${index}`,
+    time: "03:05:57",
+    message: `line ${index}`,
+    level: "info",
+  }));
+
+  const retained = trimOAuthLogs(logs);
+  const rendered = visibleOAuthLogs(retained);
+
+  assert.equal(MAX_RENDERED_OAUTH_LOGS, 400);
+  assert.equal(retained.length, MAX_PERSISTED_OAUTH_LOGS);
+  assert.equal(rendered.length, MAX_RENDERED_OAUTH_LOGS);
+  assert.equal(retained[0].id, "log-50");
+  assert.equal(rendered[0].id, `log-${MAX_PERSISTED_OAUTH_LOGS + 50 - MAX_RENDERED_OAUTH_LOGS}`);
+  assert.equal(rendered.at(-1).id, `log-${MAX_PERSISTED_OAUTH_LOGS + 49}`);
+});
+
 test("Codex OAuth runtime store persists results and restores them from storage", () => {
   const values = new Map();
   const storage = {
@@ -380,9 +426,41 @@ test("Codex OAuth logs auto-scroll while running and otherwise respect reader po
   assert.equal(shouldAutoScrollOAuthLogs({ running: false, scrollTop: 200, clientHeight: 360, scrollHeight: 2000 }), false);
 });
 
+test("Codex OAuth log tail follow survives terminal log updates when the user was at bottom", () => {
+  assert.equal(shouldFollowOAuthLogTail({ running: false, stickToBottom: true, scrollTop: 200, clientHeight: 360, scrollHeight: 2000 }), true);
+  assert.equal(shouldFollowOAuthLogTail({ running: false, stickToBottom: false, scrollTop: 200, clientHeight: 360, scrollHeight: 2000 }), false);
+  assert.equal(shouldFollowOAuthLogTail({ running: true, stickToBottom: false, scrollTop: 200, clientHeight: 360, scrollHeight: 2000 }), true);
+});
+
+test("Codex OAuth log scroll signal changes when capped logs replace the tail", () => {
+  const store = createOAuthRuntimeStore({}, null);
+  for (let index = 0; index < MAX_PERSISTED_OAUTH_LOGS; index += 1) {
+    store.appendLog({ id: `log-${index}`, time: "03:05:57", message: `line ${index}`, level: "info" });
+  }
+  const before = store.getSnapshot().logs;
+  store.appendLog({ id: "log-tail-new", time: "03:05:58", message: "new tail", level: "info" });
+  const after = store.getSnapshot().logs;
+
+  assert.equal(before.length, after.length);
+  assert.notEqual(oauthLogScrollSignal(before), oauthLogScrollSignal(after));
+});
+
 test("Codex OAuth backend logs keep polling while the page is mounted", () => {
   assert.equal(shouldPollOAuthBackendLogs({ pageMounted: true }), true);
   assert.equal(shouldPollOAuthBackendLogs({ pageMounted: false }), false);
+});
+
+test("Codex OAuth backend log polling continues while a backend job id is retained", () => {
+  assert.equal(shouldPollOAuthBackendLogsNow({ running: true, backendJobId: "" }), true);
+  assert.equal(shouldPollOAuthBackendLogsNow({ running: false, backendJobId: "job_live" }), true);
+  assert.equal(shouldPollOAuthBackendLogsNow({ running: false, backendJobId: "" }), false);
+});
+
+test("Codex OAuth backend log polling backs off when the page is hidden", () => {
+  assert.equal(oauthBackendLogPollDelay({ hidden: false }), OAUTH_LOG_POLL_VISIBLE_MS);
+  assert.equal(oauthBackendLogPollDelay({ hidden: true }), OAUTH_LOG_POLL_HIDDEN_MS);
+  assert.equal(OAUTH_LOG_POLL_VISIBLE_MS, 800);
+  assert.equal(OAUTH_LOG_POLL_HIDDEN_MS, 5000);
 });
 
 test("Codex OAuth backend logs are projected with stable ids and visible levels", () => {
@@ -531,6 +609,10 @@ test("isOAuthCandidate keeps Gmail eligible accounts and fails closed otherwise"
   assert.equal(isOAuthCandidate(accountWithProvider("cf_temp_email")), false);
   assert.equal(isOAuthCandidate(accountWithProvider("outlook")), false);
   assert.equal(isOAuthCandidate(accountWithProvider("unknown")), false);
+  assert.equal(isOAuthCandidate(accountWithProvider("gmail", {
+    status: "cooling",
+    oauth_block_reason: "账号仍在冷却期，冷却结束前不能进入 Codex OAuth",
+  })), false);
   // 后端字段缺失时默认 fail closed，未知账号不进候选。
   assert.equal(isOAuthCandidate({ id: 3, profile_path: "p", has_refresh_token: false }), false);
 });
@@ -550,6 +632,12 @@ test("manual typed non-Gmail account id produces no OAuth target and reports the
   assert.match(oauthBlockMessage(blocked[0]), /Gmail 来源/);
   // 后端字段缺失时的兜底提示同样明确。
   assert.match(oauthBlockMessage({ mail_provider: "cf_temp_email" }), /不是 Gmail 来源/);
+  assert.match(oauthBlockMessage({
+    mail_provider: "gmail",
+    status: "cooling",
+    profile_path: "C:/profiles/2",
+    has_refresh_token: false,
+  }), /冷却期/);
 });
 
 test("mixed selection never sends non-Gmail ids", () => {
@@ -582,6 +670,7 @@ test("oauthRowStatusLabel describes blocked reasons per provider", () => {
   assert.equal(oauthRowStatusLabel(gmailEligible), "OAuth 候选");
   assert.equal(oauthRowStatusLabel(accountWithProvider("gmail", { profile_path: "" })), "缺少 profile，已跳过");
   assert.equal(oauthRowStatusLabel(accountWithProvider("gmail", { has_refresh_token: true })), "已有 refresh_token，已跳过");
+  assert.equal(oauthRowStatusLabel(accountWithProvider("gmail", { status: "cooling" })), "冷却中，已跳过");
   assert.equal(oauthRowStatusLabel(accountWithProvider("cf_temp_email")), "非 Gmail，已跳过");
   assert.equal(oauthRowStatusLabel(accountWithProvider("outlook")), "非 Gmail，已跳过");
   assert.equal(oauthRowStatusLabel(accountWithProvider("unknown")), "来源未知，已跳过");

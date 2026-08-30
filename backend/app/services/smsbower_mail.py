@@ -33,8 +33,13 @@ class SmsbowerMailClient:
         last_err = ""
         for attempt in range(3):
             try:
+                cmd = ["curl.exe", "-sS"]
+                proxy = str(settings.default_proxy or "").strip()
+                if proxy:
+                    cmd.extend(["-x", proxy])
+                cmd.extend(["--connect-timeout", str(REQUEST_TIMEOUT), url])
                 proc = await asyncio.create_subprocess_exec(
-                    "curl.exe", "-s", "--connect-timeout", str(REQUEST_TIMEOUT), url,
+                    *cmd,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                     **hidden_subprocess_kwargs(),
                 )

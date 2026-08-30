@@ -18,6 +18,7 @@ from app.db import Base
 from app.db import release_expired_account_cooldowns
 from app.models import Account, HealthCheck, Registration
 from app.services.oauth_policy import (
+    BLOCK_COOLING,
     BLOCK_HAS_REFRESH_TOKEN,
     BLOCK_NO_PROFILE,
     BLOCK_NOT_GMAIL,
@@ -67,6 +68,35 @@ class OAuthPolicyTests(unittest.TestCase):
     def test_gmail_with_profile_and_no_refresh_token_is_allowed(self):
         self.assertEqual(oauth_block_reason(_account()), "")
         self.assertTrue(oauth_eligibility(_account())["oauth_eligible"])
+
+    def test_active_cooling_account_is_rejected(self):
+        from datetime import datetime, timedelta, timezone
+
+        account = _account(
+            status="cooling",
+            warmup_until=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30),
+        )
+
+        self.assertEqual(oauth_block_reason(account), BLOCK_COOLING)
+        self.assertFalse(oauth_eligibility(account)["oauth_eligible"])
+        self.assertEqual(oauth_eligibility(account)["oauth_block_reason"], BLOCK_COOLING)
+
+    def test_cooling_account_without_end_time_is_rejected_fail_closed(self):
+        account = _account(status="cooling", warmup_until=None)
+
+        self.assertEqual(oauth_block_reason(account), BLOCK_COOLING)
+        self.assertFalse(oauth_eligibility(account)["oauth_eligible"])
+
+    def test_expired_cooling_account_policy_does_not_remain_blocked(self):
+        from datetime import datetime, timedelta, timezone
+
+        account = _account(
+            status="cooling",
+            warmup_until=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1),
+        )
+
+        self.assertEqual(oauth_block_reason(account), "")
+        self.assertTrue(oauth_eligibility(account)["oauth_eligible"])
 
     def test_cf_temp_email_is_rejected(self):
         reason = oauth_block_reason(_account(mail_provider="cf_temp_email"))
@@ -133,6 +163,34 @@ class OAuthEndpointEnforcementTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as ctx:
                 await accounts_api.create_codex_oauth_job(payload)
             self.assertEqual(ctx.exception.status_code, 403)
+        finally:
+            accounts_api.SessionLocal = original_session_local
+            db.close()
+
+    async def test_job_with_cooling_account_is_rejected_without_creating_job(self):
+        from datetime import datetime, timedelta, timezone
+        from app.api import accounts as accounts_api
+
+        db = _db_session()
+        cooling = _account(
+            phone="mail_reg_cooling",
+            status="cooling",
+            warmup_until=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30),
+        )
+        db.add(cooling)
+        db.commit()
+        original_session_local = accounts_api.SessionLocal
+        accounts_api.SessionLocal = sessionmaker(bind=db.get_bind())
+        jobs_before = set(accounts_api._OAUTH_JOBS)
+        active_before = accounts_api._ACTIVE_OAUTH_JOB_ID
+        try:
+            payload = accounts_api.CodexOAuthJobBody(account_ids=[cooling.id])
+            with self.assertRaises(HTTPException) as ctx:
+                await accounts_api.create_codex_oauth_job(payload)
+            self.assertEqual(ctx.exception.status_code, 403)
+            self.assertIn("冷却", str(ctx.exception.detail))
+            self.assertEqual(set(accounts_api._OAUTH_JOBS), jobs_before)
+            self.assertEqual(accounts_api._ACTIVE_OAUTH_JOB_ID, active_before)
         finally:
             accounts_api.SessionLocal = original_session_local
             db.close()
@@ -221,11 +279,17 @@ class OAuthEndpointEnforcementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_list_accounts_reports_mail_provider_and_eligibility(self):
         from app.api import accounts as accounts_api
+        from datetime import datetime, timedelta, timezone
 
         db = _db_session()
         gmail = _account(phone="mail_reg_1")
         cf = _account(phone="mail_reg_2", mail_provider="cf_temp_email")
-        db.add_all([gmail, cf])
+        cooling = _account(
+            phone="mail_reg_3",
+            status="cooling",
+            warmup_until=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30),
+        )
+        db.add_all([gmail, cf, cooling])
         db.commit()
         try:
             items = accounts_api.list_accounts(db=db)
@@ -236,6 +300,9 @@ class OAuthEndpointEnforcementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(by_id[cf.id].mail_provider, "cf_temp_email")
             self.assertFalse(by_id[cf.id].oauth_eligible)
             self.assertTrue(by_id[cf.id].oauth_block_reason)
+            self.assertEqual(by_id[cooling.id].mail_provider, "gmail")
+            self.assertFalse(by_id[cooling.id].oauth_eligible)
+            self.assertIn("冷却", by_id[cooling.id].oauth_block_reason)
         finally:
             db.close()
 
@@ -276,6 +343,79 @@ class OAuthEndpointEnforcementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.query(HealthCheck).count(), 0)
         finally:
             db.close()
+
+
+class OAuthJobPruneTests(unittest.TestCase):
+    def setUp(self):
+        from app.api import accounts as accounts_api
+
+        self._jobs_before = dict(accounts_api._OAUTH_JOBS)
+        self._active_before = accounts_api._ACTIVE_OAUTH_JOB_ID
+        accounts_api._OAUTH_JOBS.clear()
+        accounts_api._ACTIVE_OAUTH_JOB_ID = None
+
+    def tearDown(self):
+        from app.api import accounts as accounts_api
+
+        accounts_api._OAUTH_JOBS.clear()
+        accounts_api._OAUTH_JOBS.update(self._jobs_before)
+        accounts_api._ACTIVE_OAUTH_JOB_ID = self._active_before
+
+    def test_prune_removes_only_expired_terminal_jobs(self):
+        from app.api import accounts as accounts_api
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        old = (now - timedelta(seconds=121)).isoformat()
+        fresh = (now - timedelta(seconds=30)).isoformat()
+        accounts_api._ACTIVE_OAUTH_JOB_ID = "active-terminal"
+        accounts_api._OAUTH_JOBS.update(
+            {
+                "old-failed": {"status": "failed", "finished_at": old},
+                "fresh-success": {"status": "success", "finished_at": fresh},
+                "old-running": {"status": "running", "finished_at": old},
+                "active-terminal": {"status": "failed", "finished_at": old},
+            }
+        )
+
+        with patch.object(accounts_api.settings, "oauth_job_ttl_seconds", 120), patch.object(
+            accounts_api.settings,
+            "oauth_job_max_history",
+            10,
+        ):
+            removed = accounts_api._prune_oauth_jobs(now=now)
+
+        self.assertEqual(removed, 1)
+        self.assertNotIn("old-failed", accounts_api._OAUTH_JOBS)
+        self.assertIn("fresh-success", accounts_api._OAUTH_JOBS)
+        self.assertIn("old-running", accounts_api._OAUTH_JOBS)
+        self.assertIn("active-terminal", accounts_api._OAUTH_JOBS)
+
+    def test_prune_caps_terminal_job_history_by_oldest_finished_at(self):
+        from app.api import accounts as accounts_api
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+        for index in range(5):
+            accounts_api._OAUTH_JOBS[f"terminal-{index}"] = {
+                "status": "success",
+                "finished_at": (now - timedelta(minutes=5 - index)).isoformat(),
+            }
+        accounts_api._OAUTH_JOBS["running"] = {"status": "running", "finished_at": (now - timedelta(hours=1)).isoformat()}
+
+        with patch.object(accounts_api.settings, "oauth_job_ttl_seconds", 3600), patch.object(
+            accounts_api.settings,
+            "oauth_job_max_history",
+            3,
+        ):
+            removed = accounts_api._prune_oauth_jobs(now=now)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(
+            sorted(job_id for job_id in accounts_api._OAUTH_JOBS if job_id.startswith("terminal-")),
+            ["terminal-2", "terminal-3", "terminal-4"],
+        )
+        self.assertIn("running", accounts_api._OAUTH_JOBS)
 
 
 class MailProviderMigrationTests(unittest.TestCase):

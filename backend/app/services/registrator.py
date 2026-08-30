@@ -7,6 +7,7 @@ import random
 import re
 import secrets
 import string
+import threading
 import time
 import urllib.parse
 from typing import Awaitable, Callable
@@ -48,11 +49,12 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 # ------------------------------------------------------------------
 # 实时日志钩子：注册执行器注入任务日志容器，print 统一走 emit_log
 # ------------------------------------------------------------------
-_LOG_SINKS: list[tuple[int, list]] = []
+_LOG_SINKS: dict[int, list] = {}
 _LOG_SEQ = 0
 # 日志来源标记：用 ContextVar 区分「注册工作台」与「Codex OAuth」，
 # 实现两套功能的日志隔离（见 emit_log）。默认 oauth，使既有 OAuth 行为不变。
 _LOG_SOURCE: "contextvars.ContextVar[str]" = contextvars.ContextVar("log_source", default="oauth")
+_LOG_TARGET_REG_ID: "contextvars.ContextVar[int]" = contextvars.ContextVar("log_target_reg_id", default=0)
 _OAUTH_LOG_LIMIT = 20000
 _OAUTH_LOG_BUFFER = deque(maxlen=_OAUTH_LOG_LIMIT)
 _OAUTH_LOG_DB_HYDRATED = False
@@ -60,6 +62,10 @@ _OAUTH_LOG_DB_HYDRATED = False
 # 不能被截断成「最近 N 条」，否则会丢历史。这里只防极端一次返回过多，正常轮询每次仅增量。
 _OAUTH_LOG_RESPONSE_CAP = 10000
 _OAUTH_TOKEN_EXCHANGE_LOCK = asyncio.Lock()
+_OAUTH_LOG_PENDING: deque[dict] = deque()
+_OAUTH_LOG_PENDING_LOCK = threading.Lock()
+_OAUTH_LOG_FLUSH_TASK: asyncio.Task | None = None
+_OAUTH_LOG_FLUSH_STOP: asyncio.Event | None = None
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_.\-]{20,}")
 # base32 TOTP secret：大小写均覆盖（A-Za-z2-7，16-128 位）；不含 0/1/6/8/9，
 # 因此不会误伤 32 位 hex 的 session_id / factor id。
@@ -117,12 +123,11 @@ def is_redact_enabled() -> bool:
 
 def set_log_sink(reg_id: int, lines: list) -> None:
     """注册执行器在启动任务前注入该任务的日志容器（内存 list）。"""
-    _LOG_SINKS.append((reg_id, lines))
+    _LOG_SINKS[int(reg_id)] = lines
 
 
 def clear_log_sink(reg_id: int) -> None:
-    global _LOG_SINKS
-    _LOG_SINKS = [(rid, ls) for rid, ls in _LOG_SINKS if rid != reg_id]
+    _LOG_SINKS.pop(int(reg_id), None)
 
 
 def get_oauth_logs(after: int = 0, limit: int = 300) -> dict:
@@ -172,17 +177,24 @@ def clear_oauth_logs() -> None:
     """清空 OAuth 全局日志缓冲；测试和手动清理使用。"""
     global _OAUTH_LOG_DB_HYDRATED
     _OAUTH_LOG_BUFFER.clear()
+    with _OAUTH_LOG_PENDING_LOCK:
+        _OAUTH_LOG_PENDING.clear()
     _OAUTH_LOG_DB_HYDRATED = True
 
 
-def _persist_oauth_log(seq: int, ts: str, msg: str) -> None:
-    """OAuth 日志落库（best-effort）：重启不丢，可回溯查询。写失败不影响主流程。"""
+def _persist_oauth_logs(rows: list[dict]) -> None:
+    """OAuth 日志批量落库（best-effort）：重启不丢，写失败不影响主流程。"""
+    if not rows:
+        return
     try:
         from ..db import SessionLocal
         from ..models import OAuthLog
         db = SessionLocal()
         try:
-            db.add(OAuthLog(seq=seq, ts=ts, msg=msg))
+            db.add_all(
+                OAuthLog(seq=int(row["seq"]), ts=str(row.get("ts") or ""), msg=str(row.get("msg") or ""))
+                for row in rows
+            )
             db.commit()
         finally:
             db.close()
@@ -190,18 +202,119 @@ def _persist_oauth_log(seq: int, ts: str, msg: str) -> None:
         pass
 
 
+def _drain_oauth_log_pending(limit: int | None = None) -> list[dict]:
+    with _OAUTH_LOG_PENDING_LOCK:
+        count = len(_OAUTH_LOG_PENDING) if not limit or limit <= 0 else min(limit, len(_OAUTH_LOG_PENDING))
+        return [_OAUTH_LOG_PENDING.popleft() for _ in range(count)]
+
+
+async def _flush_oauth_log_pending(limit: int | None = None) -> int:
+    rows = _drain_oauth_log_pending(limit)
+    if not rows:
+        return 0
+    await asyncio.to_thread(_persist_oauth_logs, rows)
+    return len(rows)
+
+
+async def _oauth_log_flush_loop() -> None:
+    global _OAUTH_LOG_FLUSH_STOP
+    stop_event = _OAUTH_LOG_FLUSH_STOP or asyncio.Event()
+    _OAUTH_LOG_FLUSH_STOP = stop_event
+    interval = max(0.2, float(getattr(settings, "oauth_log_flush_interval_seconds", 1.0) or 1.0))
+    batch_size = max(1, int(getattr(settings, "oauth_log_flush_batch_size", 50) or 50))
+    try:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            await _flush_oauth_log_pending(batch_size)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        # Shutdown/restart should not drop the last buffered diagnostic lines.
+        await _flush_oauth_log_pending(None)
+
+
+def start_oauth_log_writer() -> None:
+    """Start the singleton OAuth log batch writer in the current event loop."""
+    global _OAUTH_LOG_FLUSH_TASK, _OAUTH_LOG_FLUSH_STOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _OAUTH_LOG_FLUSH_TASK and not _OAUTH_LOG_FLUSH_TASK.done():
+        try:
+            task_loop = _OAUTH_LOG_FLUSH_TASK.get_loop()
+        except RuntimeError:
+            task_loop = None
+        if task_loop is loop:
+            return
+        try:
+            if task_loop is not None and not task_loop.is_closed():
+                task_loop.call_soon_threadsafe(_OAUTH_LOG_FLUSH_TASK.cancel)
+        except Exception:
+            pass
+        _OAUTH_LOG_FLUSH_TASK = None
+        _OAUTH_LOG_FLUSH_STOP = None
+    _OAUTH_LOG_FLUSH_STOP = asyncio.Event()
+    _OAUTH_LOG_FLUSH_TASK = loop.create_task(_oauth_log_flush_loop())
+
+
+async def stop_oauth_log_writer() -> None:
+    """Stop the batch writer and flush pending OAuth logs."""
+    global _OAUTH_LOG_FLUSH_TASK, _OAUTH_LOG_FLUSH_STOP
+    task = _OAUTH_LOG_FLUSH_TASK
+    if _OAUTH_LOG_FLUSH_STOP:
+        _OAUTH_LOG_FLUSH_STOP.set()
+    if task and not task.done():
+        try:
+            running_loop = asyncio.get_running_loop()
+            task_loop = task.get_loop()
+        except RuntimeError:
+            running_loop = None
+            task_loop = None
+        if running_loop is not None and task_loop is not None and task_loop is not running_loop:
+            # Test runners and dev reloads may create the singleton writer on a
+            # loop that has already stopped.  Such tasks cannot be awaited from
+            # the current loop; drop the stale handle and flush the shared queue
+            # here so diagnostic lines are still persisted best-effort.
+            try:
+                if not task_loop.is_closed():
+                    task_loop.call_soon_threadsafe(task.cancel)
+            except Exception:
+                pass
+            await _flush_oauth_log_pending(None)
+            _OAUTH_LOG_FLUSH_TASK = None
+            _OAUTH_LOG_FLUSH_STOP = None
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    else:
+        await _flush_oauth_log_pending(None)
+    _OAUTH_LOG_FLUSH_TASK = None
+    _OAUTH_LOG_FLUSH_STOP = None
+
+
 def _schedule_oauth_log_persistence(seq: int, ts: str, msg: str) -> None:
-    """Persist without blocking the event loop that drives browser/OAuth work.
+    """Queue log persistence without per-line threads/SQLite commits.
 
     OAuth logs are best-effort diagnostics. SQLite contention must never prevent
     the in-memory live log, job cancellation, or browser cleanup from running.
     """
+    row = {"seq": int(seq), "ts": str(ts), "msg": str(msg)}
+    with _OAUTH_LOG_PENDING_LOCK:
+        _OAUTH_LOG_PENDING.append(row)
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
-        _persist_oauth_log(seq, ts, msg)
+        rows = _drain_oauth_log_pending(None)
+        _persist_oauth_logs(rows)
         return
-    loop.create_task(asyncio.to_thread(_persist_oauth_log, seq, ts, msg))
+    start_oauth_log_writer()
 
 
 def emit_log(msg: str, flush: bool = True) -> None:
@@ -222,9 +335,12 @@ def emit_log(msg: str, flush: bool = True) -> None:
     ts = time.strftime("%H:%M:%S")
     line = {"seq": _LOG_SEQ, "ts": ts, "msg": safe_msg}
     if _LOG_SOURCE.get() == "register":
-        if _LOG_SINKS:
-            for _, lines in _LOG_SINKS:
-                lines.append(line)
+        target_reg_id = int(_LOG_TARGET_REG_ID.get() or 0)
+        if target_reg_id and target_reg_id in _LOG_SINKS:
+            _LOG_SINKS[target_reg_id].append(line)
+        elif len(_LOG_SINKS) == 1:
+            # 单任务测试/兼容路径：没有显式 target 时仍可写入唯一注册 sink。
+            next(iter(_LOG_SINKS.values())).append(line)
     else:
         # Publish to the live buffer before any console I/O.  On Windows the
         # backend may be restarted with stdout attached to a pipe that no
@@ -247,6 +363,16 @@ def set_log_source(source: str) -> "contextvars.Token":
 def reset_log_source(token: "contextvars.Token") -> None:
     """还原 set_log_source 设置的日志来源（任务结束/切换前调用）。"""
     _LOG_SOURCE.reset(token)
+
+
+def set_log_target(reg_id: int) -> "contextvars.Token":
+    """设置当前 asyncio 任务的注册日志目标，避免并发任务互相串日志。"""
+    return _LOG_TARGET_REG_ID.set(int(reg_id))
+
+
+def reset_log_target(token: "contextvars.Token") -> None:
+    """还原 set_log_target 设置的注册日志目标。"""
+    _LOG_TARGET_REG_ID.reset(token)
 
 
 def log_source(source: str):
@@ -563,6 +689,15 @@ class EmailSubmitNotConsumedError(GmailPreVerificationNotConsumedError):
         super().__init__("email", detail)
 
 
+class EmailPostSubmitNotConsumedError(GmailPreVerificationNotConsumedError):
+    """邮箱提交后仍未进入验证/密码页，未触发验证码，不应消耗 Gmail 配额。"""
+
+    non_consuming_reason = "email_post_submit_not_consumed"
+
+    def __init__(self, detail: str):
+        super().__init__("email", detail)
+
+
 class GoogleLoginPageNotConsumedError(GmailPreVerificationNotConsumedError):
     """停在 Google 登录页且未进入邮箱验证，Gmail 订单本轮不应计入配额。"""
 
@@ -784,6 +919,35 @@ async def _capture_registration_debug(page, tag: str) -> str:
         return ""
 
 
+def _debug_page_is_closed(page) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return False
+
+
+async def _debug_screenshot_loop(page, reg_id: int, interval_seconds: float | None = None) -> None:
+    """定时刷新调试截图缓存；页面关闭或任务 cancel 后必须退出。"""
+    interval = max(
+        1.0,
+        float(interval_seconds)
+        if interval_seconds is not None
+        else float(getattr(settings, "debug_screenshot_interval_ms", 2000)) / 1000,
+    )
+    while True:
+        if _debug_page_is_closed(page):
+            return
+        try:
+            if capture_screenshot:
+                await capture_screenshot(page, reg_id)
+        except Exception:
+            if _debug_page_is_closed(page):
+                return
+        if _debug_page_is_closed(page):
+            return
+        await asyncio.sleep(interval)
+
+
 async def wait_for_phase(page, expected: str, timeout_s: float, stage: str, interval: float = 1.0, challenge_grace_s: float = 0) -> dict:
     """等待页面进入预期阶段，超时抛 PageStuckError。
 
@@ -892,6 +1056,53 @@ async def wait_for_any_phase(page, expected_set, timeout_s: float, stage: str, i
         raise OpenAIErrorPageError(f"等待{expected}时（错误页在时限内未恢复）", label=_page_error_label(last_state or {}))
     await _capture_registration_debug(page, f"stuck_{'+'.join(expected)}")
     raise PageStuckError(stage, f"等待阶段[{'+'.join(expected)}]超时，实际[{last_state['phase']}] {last_state['url']}")
+
+
+async def _has_visible_locator(page, selectors: list[str] | tuple[str, ...]) -> bool:
+    """Fast visibility probe for a selector list without Playwright auto-waiting."""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() and await locator.is_visible(timeout=250):
+                return True
+        except TypeError:
+            try:
+                if await locator.count() and await locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
+
+
+async def wait_for_password_or_code_entry(page, timeout_s: float = 20.0, interval: float = 0.5) -> dict:
+    """Wait until email signup has an actionable password/code step.
+
+    OpenAI sometimes leaves the URL/phase at email-verification after clicking
+    "Continue with password" while the password route is still hydrating.  Do
+    not start polling Gmail or filling OTP until either the password field or a
+    real OTP field is visible; otherwise the worker can spend minutes retrying
+    code entry on a page that actually still needs the password step.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    last_state: dict | None = None
+    while asyncio.get_event_loop().time() < deadline:
+        state = await probe_page(page)
+        last_state = state
+        raise_if_challenge(state, "等待密码/验证码输入框时")
+        if state["phase"] in (PHASE_ABOUT_YOU, PHASE_CHATGPT_HOME):
+            return state
+        if state["phase"] == PHASE_SET_PASSWORD or await _has_visible_locator(page, PASSWORD_INPUT_SELECTORS):
+            return {**state, "phase": PHASE_SET_PASSWORD}
+        if state["phase"] == PHASE_EMAIL_VERIFICATION and await _has_visible_locator(page, CODE_INPUT_SELECTORS):
+            return state
+        await asyncio.sleep(interval)
+    await _capture_registration_debug(page, "stuck_password_or_code_entry")
+    actual = last_state or {"phase": PHASE_UNKNOWN, "url": getattr(page, "url", "")}
+    raise EmailPostSubmitNotConsumedError(
+        f"Continue with password 后未出现密码框或验证码输入框，实际[{actual['phase']}] {actual['url']}"
+    )
 
 
 async def fetch_authorize(
@@ -1090,6 +1301,12 @@ def _birthday_iso(year: int, month: int, day: int) -> str:
     return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
 
 
+# A corrupted React Aria segment must never turn into thousands of individual
+# ArrowUp/ArrowDown events.  Normal placeholder-to-birthday changes are well
+# below this bound; larger deltas use the direct segment-entry fallback.
+BIRTHDAY_ARROW_ADJUSTMENT_LIMIT = 120
+
+
 def _birthday_segment_order(labels: list[str], month: int, day: int, year: int) -> list[tuple[int, str, str]]:
     """Map React Aria date segments by semantic label instead of DOM order."""
     result: list[tuple[int, str, str]] = []
@@ -1100,9 +1317,9 @@ def _birthday_segment_order(labels: list[str], month: int, day: int, year: int) 
             (
                 candidate
                 for candidate, markers in (
-                    ("month", ("month", "월", "mm")),
-                    ("day", ("day", "일", "dd")),
-                    ("year", ("year", "년", "yyyy")),
+                    ("month", ("month", "mois", "mes", "monat", "mese", "mês", "月", "월", "mm")),
+                    ("day", ("day", "jour", "dia", "día", "tag", "giorno", "日", "일", "dd")),
+                    ("year", ("year", "annee", "année", "año", "ano", "jahr", "anno", "年", "년", "yyyy")),
                 )
                 if any(marker == label or marker in label for marker in markers)
             ),
@@ -1153,15 +1370,14 @@ def _should_retry_birthday_hidden_sync(
     submission_ready: bool,
     react_aria_attempted: bool,
 ) -> bool:
-    """Whether to force one last ISO write into the submitted birthday field.
+    """Whether a non-React birthday control should receive one last ISO write.
 
     React Aria DateField can leave the visible segments correct while the
-    hidden input is stale after keyboard/segment attempts. The hidden input is
-    still the submitted form value, so the final DOM sync must remain available
-    even when the React Aria-specific fill path has already been attempted.
+    hidden input stale after keyboard/segment attempts. Its semantic helper
+    owns the only trustworthy synchronization path; a DOM-only setter must not
+    be treated as a successful React state update.
     """
-    _ = react_aria_attempted
-    return bool(has_attempt and not submission_ready)
+    return bool(has_attempt and not submission_ready and not react_aria_attempted)
 
 
 async def _fill_react_aria_datefield(page, iso: str, month: int, day: int, year: int) -> dict:
@@ -1174,8 +1390,9 @@ async def _fill_react_aria_datefield(page, iso: str, month: int, day: int, year:
     labels: list[str] = []
     for index in range(count):
         spin = spins.nth(index)
+        data_type = await spin.get_attribute("data-type") or ""
         label = await spin.get_attribute("aria-label") or await spin.get_attribute("aria-labelledby") or ""
-        labels.append(label)
+        labels.append(" ".join(part for part in (data_type, label) if part))
     order = _birthday_segment_order(labels, month, day, year)
     if len(order) != 3:
         return {"attempted": True, "ready": False, "hidden_present": False, "hidden_value": "", "spin_values": [], "order": order}
@@ -1209,6 +1426,13 @@ async def _fill_react_aria_datefield(page, iso: str, month: int, day: int, year:
         if current is None:
             return False
         delta = target - current
+        if abs(delta) > BIRTHDAY_ARROW_ADJUSTMENT_LIMIT:
+            emit_log(
+                f"[stage:profile] birthday segment delta too large current={current} "
+                f"target={target}; using direct entry",
+                flush=True,
+            )
+            return False
         if delta:
             key = "ArrowUp" if delta > 0 else "ArrowDown"
             for _ in range(abs(delta)):
@@ -1729,8 +1953,13 @@ async def fill_password_with_reload(page, password: str, max_reloads: int = PASS
     return False
 
 
-async def fill_code_with_reload(page, code: str, max_reloads: int = CODE_FILL_MAX_RELOADS) -> bool:
-    """填写邮箱验证码；控件失效或重绘后刷新验证页并重新定位。"""
+async def fill_code_with_reload(page, code: str, max_reloads: int = CODE_FILL_MAX_RELOADS, password: str = "") -> bool:
+    """填写邮箱验证码；控件失效或重绘后刷新验证页并重新定位。
+
+    OpenAI 注册页偶发在刷新邮箱验证页后回到 create-account/password。
+    若调用方提供了本轮密码，则重新提交密码并回到 email-verification，
+    避免已收到验证码的轮次被错误判为验证码填充失败。
+    """
     reloads = max(0, int(max_reloads))
     for attempt in range(reloads + 1):
         code_input = await pick_visible(
@@ -1759,14 +1988,34 @@ async def fill_code_with_reload(page, code: str, max_reloads: int = CODE_FILL_MA
         try:
             await page.reload(wait_until="domcontentloaded", timeout=60000)
             await wait_spa_ready(page)
-            state = await wait_for_phase(
+            state = await wait_for_any_phase(
                 page,
-                PHASE_EMAIL_VERIFICATION,
+                (PHASE_EMAIL_VERIFICATION, PHASE_SET_PASSWORD),
                 60,
                 "email",
                 challenge_grace_s=60,
             )
             raise_if_challenge(state, "刷新邮箱验证页后")
+            if state["phase"] == PHASE_SET_PASSWORD:
+                if not password:
+                    emit_log("[stage:fill_code] 刷新后回到密码页，但缺少本轮密码，继续重试", flush=True)
+                    continue
+                emit_log("[stage:fill_code] 刷新后回到密码页，重新提交密码后继续填验证码", flush=True)
+                if not await fill_password_with_reload(page, password):
+                    emit_log("[stage:fill_code] 密码页恢复失败：密码填充未生效", flush=True)
+                    continue
+                if not await click_locator(page.locator('button[type="submit"]').first):
+                    emit_log("[stage:fill_code] 密码页恢复失败：未能提交密码", flush=True)
+                    continue
+                await page.wait_for_timeout(random.randint(1200, 2500))
+                state = await wait_for_phase(
+                    page,
+                    PHASE_EMAIL_VERIFICATION,
+                    60,
+                    "email",
+                    challenge_grace_s=60,
+                )
+                raise_if_challenge(state, "验证码填充重试前重新提交密码后")
         except Exception as error:  # noqa: BLE001
             emit_log(f"[stage:fill_code] 刷新邮箱验证页失败，继续重试: {str(error)[:180]}", flush=True)
     return False
@@ -4499,12 +4748,41 @@ class Registrator:
                     emit_log(f"[stage:profile] birthday diag before iso={iso} inputs={diag.get('inputs',[])} spins={diag.get('spins',[])} selects={diag.get('selects',[])}", flush=True)
                 except Exception as diag_e:
                     emit_log(f"[stage:profile] birthday diag failed: {diag_e}", flush=True)
+                # React Aria DateField owns the hidden form value.  Interacting
+                # with its backing inputs or with page.keyboard first can leave
+                # the visible segments and React state disagreeing, so give the
+                # semantic segment path the first opportunity to synchronize.
+                react_aria_state: dict = {}
+                try:
+                    react_aria_spin_count = await page.locator('[role="spinbutton"]').count()
+                except Exception:
+                    react_aria_spin_count = 0
+                react_aria_preferred = react_aria_spin_count >= 3
+                if react_aria_preferred:
+                    try:
+                        react_aria_state = await _fill_react_aria_datefield(page, iso, month, day, year)
+                    except Exception as react_error:
+                        emit_log(f"[stage:profile] birthday React Aria fill exception: {react_error}", flush=True)
+                        react_aria_state = {"attempted": True, "ready": False}
+                    if len(react_aria_state.get("order", ())) == 3:
+                        emit_log("[stage:profile] detected React Aria birthday field; legacy keyboard path skipped", flush=True)
+                    else:
+                        # Three spinbuttons in this form are still treated as
+                        # the date field.  A failed semantic lookup must fail
+                        # closed instead of re-entering the legacy global
+                        # keyboard trial that corrupted reg_800.
+                        emit_log(
+                            "[stage:profile] React Aria birthday segments could not be identified; "
+                            "legacy keyboard path disabled",
+                            flush=True,
+                        )
                 native_count = 0
                 date_locators = page.locator(
                     'input[type="date"], input[name="birthday"], input[name="dateOfBirth"], '
                     'input[name="birthdate"], input[autocomplete="bday"], input[placeholder*="birth" i], input[placeholder*="Birthday" i]'
                 )
-                for date_index in range(await date_locators.count()):
+                date_locator_count = 0 if react_aria_preferred else await date_locators.count()
+                for date_index in range(date_locator_count):
                     date_loc = date_locators.nth(date_index)
                     try:
                         if await date_loc.is_visible():
@@ -4514,26 +4792,29 @@ class Registrator:
                     except Exception:
                         continue
                 # 兜底：按 value 形态定位今天/日期输入（例如 2026-08-20）
-                try:
-                    generic_date_indices = await page.evaluate(
-                        """() => Array.from(document.querySelectorAll('input'))
-                          .map((el, index) => ({el, index}))
-                          .filter(({el}) => el.offsetParent !== null &&
-                            (/^\\d{4}-\\d{1,2}-\\d{1,2}$/.test(el.value || '') || /^\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4}$/.test(el.value || '') || el.type === 'date'))
-                          .map(({index}) => index)"""
-                    )
-                    for date_index in generic_date_indices:
-                        try:
-                            await page.locator("input").nth(int(date_index)).fill(iso)
-                            native_count += 1
-                        except Exception:
-                            continue
-                except Exception:
-                    generic_date_indices = []
+                generic_date_indices = []
+                if not react_aria_preferred:
+                    try:
+                        generic_date_indices = await page.evaluate(
+                            """() => Array.from(document.querySelectorAll('input'))
+                              .map((el, index) => ({el, index}))
+                              .filter(({el}) => el.offsetParent !== null &&
+                                (/^\\d{4}-\\d{1,2}-\\d{1,2}$/.test(el.value || '') || /^\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4}$/.test(el.value || '') || el.type === 'date'))
+                              .map(({index}) => index)"""
+                        )
+                        for date_index in generic_date_indices:
+                            try:
+                                await page.locator("input").nth(int(date_index)).fill(iso)
+                                native_count += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        generic_date_indices = []
                 # JS setter 兜底：hidden + 任何含日期值输入
                 set_count = 0
                 try:
-                    set_count = await page.evaluate(
+                    set_count = (
+                        await page.evaluate(
                         r"""iso => {
                           const setVal = (el, v) => {
                             try {
@@ -4556,7 +4837,10 @@ class Registrator:
                           });
                           return n;
                         }""",
-                        iso,
+                            iso,
+                        )
+                        if not react_aria_preferred
+                        else 0
                     )
                 except Exception:
                     set_count = 0
@@ -4592,7 +4876,11 @@ class Registrator:
                 except Exception:
                     mdy_hidden_ok = False
                 # 如果 hidden/visible 仍未命中，尝试更多变体
-                if not (hidden_ok or visible_ok or mdy_hidden_ok):
+                if (
+                    not react_aria_preferred
+                    and not (hidden_ok or visible_ok or mdy_hidden_ok)
+                    and await page.locator('[role="spinbutton"]').count() < 3
+                ):
                     # 1) 可见输入若为 MM/DD/YYYY 或 DD/MM/YYYY，尝试 mdy 再填一次（同时兼容 2026 年占位）
                     try:
                         await page.evaluate(
@@ -4665,7 +4953,6 @@ class Registrator:
                     except Exception:
                         pass
                     # 3) React Aria DateField：3 个 spinbutton（月/日/年）- 兼容 DMY/MDY 与 aria-label，兼容有/无前导零
-                    react_aria_state = {}
                     try:
                         spins = page.locator('[role="spinbutton"]')
                         cnt = await spins.count()
@@ -4674,7 +4961,12 @@ class Registrator:
                             spin_txts_before = []
                             for i in range(cnt):
                                 try:
-                                    lab = await spins.nth(i).get_attribute("aria-label") or await spins.nth(i).get_attribute("aria-labelledby") or ""
+                                    lab = (
+                                        await spins.nth(i).get_attribute("data-type")
+                                        or await spins.nth(i).get_attribute("aria-label")
+                                        or await spins.nth(i).get_attribute("aria-labelledby")
+                                        or ""
+                                    )
                                     txt = await spins.nth(i).inner_text()
                                     spin_txts_before.append((txt or "").strip())
                                     labels.append((lab or txt or "").lower())
@@ -4818,11 +5110,14 @@ class Registrator:
                             emit_log(f"[stage:profile] birthday spin cnt={cnt} <3 skip", flush=True)
                     except Exception as se:
                         emit_log(f"[stage:profile] birthday spin exception: {se}", flush=True)
-                    # The hidden input is the React form state. Re-run the
-                    # segment interaction after legacy fallbacks and verify it
-                    # again, because DOM-only setters are overwritten by React.
+                    # Legacy variants can reveal spinbuttons only after their
+                    # initial DOM pass.  Run the semantic path once in that
+                    # case; DOM-only setters are not a React state substitute.
                     try:
-                        if await page.locator('[role="spinbutton"]').count() >= 3:
+                        if (
+                            not react_aria_state.get("attempted")
+                            and await page.locator('[role="spinbutton"]').count() >= 3
+                        ):
                             react_aria_state = await _fill_react_aria_datefield(page, iso, month, day, year)
                     except Exception as react_error:
                         emit_log(f"[stage:profile] birthday React Aria fill exception: {react_error}", flush=True)
@@ -4874,7 +5169,11 @@ class Registrator:
                 else:
                     # 已有 hidden/visible 命中，直接记录
                     visible_ok = hidden_ok or visible_ok or mdy_hidden_ok
-                react_aria_attempted = bool(react_aria_state.get("attempted"))
+                # A detected React Aria field is considered attempted even if
+                # a defensive helper error left an incomplete result object.
+                # This keeps raw hidden-input writes from being treated as a
+                # successful component update.
+                react_aria_attempted = bool(react_aria_state.get("attempted") or react_aria_preferred)
                 submission_ready = (
                     bool(react_aria_state.get("ready"))
                     if react_aria_attempted
@@ -4890,8 +5189,10 @@ class Registrator:
                     has_attempt=has_attempt,
                     submission_ready=submission_ready,
                     react_aria_attempted=react_aria_attempted,
-                ):
-                    # 最后再尝试一次：直接对所有隐藏字段写 ISO 并触发表单验证
+                ) and not react_aria_attempted and not react_aria_preferred:
+                    # Non-React date controls can be repaired with a final ISO
+                    # setter.  For React Aria, a DOM-only write is not proof of
+                    # component state and must never promote submission_ready.
                     try:
                         await page.evaluate(
                             r"""iso => {
@@ -5245,16 +5546,8 @@ class Registrator:
                                 emit_log(f"[debug] 已开启抓包/截图 reg={_debug_reg_id} trace={_debug_trace_path}", flush=True)
                             except Exception as _e:
                                 emit_log(f"[debug] 抓包初始化失败: {str(_e)[:160]}", flush=True)
-                            # 定时截图（2s）供前端/助手拉取
-                            async def _screenshot_loop():
-                                while True:
-                                    try:
-                                        if capture_screenshot:
-                                            await capture_screenshot(page, _debug_reg_id)
-                                    except Exception:
-                                        pass
-                                    await asyncio.sleep(max(1.0, float(getattr(settings, "debug_screenshot_interval_ms", 2000)) / 1000))
-                            _debug_screenshot_task = asyncio.create_task(_screenshot_loop())
+                            # 定时截图（2s）供前端/助手拉取；页面关闭或任务结束后必须退出。
+                            _debug_screenshot_task = asyncio.create_task(_debug_screenshot_loop(page, _debug_reg_id))
                     except Exception as _e:
                         emit_log(f"[debug] 调试捕获初始化异常: {str(_e)[:160]}", flush=True)
 
@@ -5330,6 +5623,14 @@ class Registrator:
                         raise GoogleLoginPageNotConsumedError(
                             "停在 Google 登录页，未进入邮箱验证流程"
                         )
+                    if gmail_mode:
+                        emit_log(
+                            "[gmail] 邮箱提交后未进入验证/密码页，尚未触发验证码；本轮不消耗 Gmail 配额",
+                            flush=True,
+                        )
+                        raise EmailPostSubmitNotConsumedError(
+                            f"邮箱提交后未跳转验证页: {errs or detail.get('bodyText', '')[:150]}"
+                        )
                     raise PageStuckError("email", f"邮箱提交后未跳转验证页: {errs or detail.get('bodyText', '')[:150]}")
 
                 # 真实用户提交邮箱后会阅读页面/等待邮件到达：随机停顿几秒
@@ -5363,6 +5664,13 @@ class Registrator:
                 else:
                     emit_log(f"[stage:password] 已直跳密码页 phase={state['phase']}，跳过 Continue with password", flush=True)
                     await page.wait_for_timeout(random.randint(800, 1500))
+
+                if state["phase"] == PHASE_EMAIL_VERIFICATION:
+                    state = await wait_for_password_or_code_entry(page, timeout_s=20)
+                    emit_log(
+                        f"[stage:password] 可操作入口确认 phase={state['phase']} url={state['url'][:120]}",
+                        flush=True,
+                    )
 
                 # 3. 设置密码：校验 DOM 实际值，避免 React 重绘导致 fill 静默丢失。
                 if state["phase"] == PHASE_SET_PASSWORD or await page.locator('input[type="password"]').first.count():
@@ -5421,7 +5729,7 @@ class Registrator:
                 # 5. 填验证码（fill 避免原生 click 卡住；快速路径不再随机输错，减少无效等待）
                 await asyncio.sleep(step_pause())
                 emit_log("[stage:fill_code] 填写并提交邮箱验证码", flush=True)
-                if not await fill_code_with_reload(page, code):
+                if not await fill_code_with_reload(page, code, password=password):
                     current = await probe_page(page)
                     raise WrongPhaseError(
                         "email",
@@ -5534,6 +5842,14 @@ class Registrator:
             if is_browser_network_error(error):
                 raise ProxyNetworkError(str(error)[:300]) from error
             raise RegisterError("email", str(error)[:300]) from error
+        finally:
+            if '_debug_screenshot_task' in locals() and _debug_screenshot_task:
+                try:
+                    if not _debug_screenshot_task.done():
+                        _debug_screenshot_task.cancel()
+                    await asyncio.gather(_debug_screenshot_task, return_exceptions=True)
+                except Exception:
+                    pass
 
         user = session.get("user", {}) if isinstance(session, dict) else {}
         email = user.get("email", "") or address

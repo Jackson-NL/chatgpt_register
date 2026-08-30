@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
@@ -46,9 +46,11 @@ import {
   loadSavedOAuthForm,
   oauthBlockMessage,
   oauthMailProvider,
+  oauthLogScrollSignal,
   oauthRowStatusLabel,
   oauthStageIndex,
   oauthStagesForMode,
+  visibleOAuthLogs,
   paginateOAuthAccounts,
   saveOAuthForm,
   summarizeOAuthAccounts,
@@ -59,6 +61,7 @@ import {
   startOAuthBackendLogPolling,
   stopOAuthBackendLogPolling,
   shouldAutoScrollOAuthLogs,
+  shouldFollowOAuthLogTail,
   shouldFallbackToAutoPhone,
   staleOAuthJobPatch,
 } from "./codexOAuthUtils";
@@ -205,7 +208,31 @@ export default function CodexOAuth() {
   const [runtime, setRuntime] = useState(() => codexOAuthRuntime.getSnapshot());
   const mountedRef = useRef(false);
   const logPanelRef = useRef(null);
+  const logStickRef = useRef(true);
+  const [logFollowing, setLogFollowing] = useState(true);
   const { running, activeAction, currentTarget, currentStage, currentFlow, runStatus, results, logs, backendJobId, targetCount, concurrency, activeAccountIds } = runtime;
+  const renderedLogs = useMemo(() => visibleOAuthLogs(logs), [logs]);
+  const hiddenLogCount = Math.max(0, logs.length - renderedLogs.length);
+  const logScrollSignal = useMemo(() => oauthLogScrollSignal(logs), [logs]);
+
+  const scrollOAuthLogToBottom = useCallback(() => {
+    const panel = logPanelRef.current;
+    if (!panel) return;
+    panel.scrollTop = panel.scrollHeight;
+  }, []);
+
+  const updateOAuthLogStickiness = useCallback(() => {
+    const panel = logPanelRef.current;
+    if (!panel) return;
+    const atBottom = shouldAutoScrollOAuthLogs({
+      running: false,
+      scrollTop: panel.scrollTop,
+      clientHeight: panel.clientHeight,
+      scrollHeight: panel.scrollHeight,
+    });
+    logStickRef.current = atBottom;
+    setLogFollowing(atBottom);
+  }, []);
 
   const loadAccounts = useCallback(async () => {
     setLoadingAccounts(true);
@@ -234,30 +261,36 @@ export default function CodexOAuth() {
     };
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const panel = logPanelRef.current;
     if (!panel || logs.length === 0) return undefined;
+    const follow = shouldFollowOAuthLogTail({
+      running,
+      stickToBottom: logStickRef.current,
+      scrollTop: panel.scrollTop,
+      clientHeight: panel.clientHeight,
+      scrollHeight: panel.scrollHeight,
+    });
+    if (!follow) return undefined;
+
     let settleFrame = null;
+    let settleTimer = null;
+    scrollOAuthLogToBottom();
     const frame = window.requestAnimationFrame(() => {
-      const follow = running || shouldAutoScrollOAuthLogs({
-        running,
-        scrollTop: panel.scrollTop,
-        clientHeight: panel.clientHeight,
-        scrollHeight: panel.scrollHeight,
-      });
-      if (!follow) return;
-      panel.scrollTop = panel.scrollHeight;
+      scrollOAuthLogToBottom();
       // A wrapped log row can change the scroll height after the first layout.
       // Follow once more so the newest line remains visible after remounts.
       settleFrame = window.requestAnimationFrame(() => {
-        if (running) panel.scrollTop = panel.scrollHeight;
+        scrollOAuthLogToBottom();
       });
+      settleTimer = window.setTimeout(scrollOAuthLogToBottom, 80);
     });
     return () => {
       window.cancelAnimationFrame(frame);
       if (settleFrame !== null) window.cancelAnimationFrame(settleFrame);
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
     };
-  }, [logs.length, running]);
+  }, [logScrollSignal, running, scrollOAuthLogToBottom]);
 
   const appendLog = useCallback((message, level = "info") => {
     codexOAuthRuntime.appendLog({ id: `${Date.now()}-${Math.random()}`, time: timestamp(), message, level });
@@ -281,7 +314,7 @@ export default function CodexOAuth() {
             .then((persistedJob) => {
               if (!alive) return;
               applyJobSnapshot(persistedJob);
-              if (persistedJob?.running) seedBackendLogCursor().then(() => startOAuthBackendLogPolling());
+              if (persistedJob?.running) startOAuthBackendLogPolling();
             })
             .catch((error) => {
               if (!alive) return;
@@ -295,7 +328,7 @@ export default function CodexOAuth() {
           return;
         }
         applyJobSnapshot(job);
-        seedBackendLogCursor().then(() => startOAuthBackendLogPolling());
+        startOAuthBackendLogPolling();
       })
       .catch((error) => {
         if (alive) appendLog(`后台 OAuth 任务状态恢复失败：${formatOAuthErrorMessage(error)}`, "warning");
@@ -594,20 +627,30 @@ export default function CodexOAuth() {
           extra={(
             <div className="flex items-center gap-2">
               {running && <Badge color="success" dot>{t("运行中 · 自动滚动到最新")}</Badge>}
+              {!running && !logFollowing && <Button variant="ghost" size="sm" icon={<ChevronDown size={12} />} onClick={() => { logStickRef.current = true; setLogFollowing(true); scrollOAuthLogToBottom(); }}>回到底部</Button>}
               <Button variant="ghost" size="sm" icon={<Terminal size={12} />} onClick={() => codexOAuthRuntime.clearLogs()}>清空</Button>
             </div>
           )}
           pad={false}
           className={`overflow-hidden ${running ? "sticky top-[88px] z-10 border-blue-200 shadow-xl ring-1 ring-blue-100" : ""}`}
         >
-          <div ref={logPanelRef} className={`${running ? "max-h-[calc(100vh-190px)]" : "max-h-[540px]"} min-h-[360px] overflow-y-auto bg-[#0d1117] px-3 py-2`}>
-            {logs.length === 0 ? <div className="flex min-h-[344px] items-center justify-center text-[11px] text-slate-600">暂无 OAuth 日志；点击右上角按钮开始</div> : logs.map((log) => (
-              <div key={log.id} className="flex items-start gap-2 py-px font-mono text-[11.5px] leading-[1.7]">
-                <span className={`mt-[7px] h-1 w-1 shrink-0 rounded-full ${log.level === "error" ? "bg-red-500" : log.level === "success" ? "bg-emerald-500" : log.level === "warning" ? "bg-amber-500" : "bg-slate-500"}`} />
-                <span className="shrink-0 text-slate-600">{log.time}</span>
-                <span className={`min-w-0 whitespace-pre-wrap break-all ${log.level === "error" ? "text-red-400" : log.level === "success" ? "text-emerald-400" : log.level === "warning" ? "text-amber-400" : "text-slate-300"}`}>{log.message}</span>
-              </div>
-            ))}
+          <div ref={logPanelRef} onScroll={updateOAuthLogStickiness} className={`${running ? "max-h-[calc(100vh-190px)]" : "max-h-[540px]"} min-h-[360px] overflow-y-auto bg-[#0d1117] px-3 py-2`}>
+            {logs.length === 0 ? <div className="flex min-h-[344px] items-center justify-center text-[11px] text-slate-600">暂无 OAuth 日志；点击右上角按钮开始</div> : (
+              <>
+                {hiddenLogCount > 0 && (
+                  <div className="sticky top-0 z-10 mb-1 rounded bg-slate-900/95 px-2 py-1 font-mono text-[11px] text-slate-500">
+                    已隐藏较早 {hiddenLogCount} 行，仅渲染最近 {renderedLogs.length} 行；完整历史可查后端 OAuth 日志。
+                  </div>
+                )}
+                {renderedLogs.map((log) => (
+                  <div key={log.id} className="flex items-start gap-2 py-px font-mono text-[11.5px] leading-[1.7]">
+                    <span className={`mt-[7px] h-1 w-1 shrink-0 rounded-full ${log.level === "error" ? "bg-red-500" : log.level === "success" ? "bg-emerald-500" : log.level === "warning" ? "bg-amber-500" : "bg-slate-500"}`} />
+                    <span className="shrink-0 text-slate-600">{log.time}</span>
+                    <span className={`min-w-0 whitespace-pre-wrap break-all ${log.level === "error" ? "text-red-400" : log.level === "success" ? "text-emerald-400" : log.level === "warning" ? "text-amber-400" : "text-slate-300"}`}>{log.message}</span>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         </Panel>
 

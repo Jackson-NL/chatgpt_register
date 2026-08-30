@@ -173,7 +173,7 @@ export const api = {
     logs: (id, params = {}) => {
       const qs = new URLSearchParams();
       if (params.after != null) qs.set("after", params.after);
-      if (params.limit) qs.set("limit", params.limit);
+      if (params.limit != null) qs.set("limit", params.limit);
       const s = qs.toString();
       return GET(`/registrations/${id}/logs${s ? `?${s}` : ""}`);
     },
@@ -202,7 +202,7 @@ export const api = {
     logs: (id, params = {}) => {
       const qs = new URLSearchParams();
       if (params.after != null) qs.set("after", params.after);
-      if (params.limit) qs.set("limit", params.limit);
+      if (params.limit != null) qs.set("limit", params.limit);
       return GET(`/batches/${id}/logs?${qs.toString()}`);
     },
     clearLogs: (id) => DEL(`/batches/${id}/logs`),
