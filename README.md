@@ -221,14 +221,11 @@ npm run build
 - API 当前无鉴权，CORS 全开（`allow_origins=["*"]`），仅适用于本地内网环境，不要暴露到公网。
 - `data/`、`profiles/`、`.env`、`output/` 均已在 `.gitignore` 中排除，请勿提交到公共仓库。
 
-## 📈 Star History
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Jackson-NL/codex_register&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Jackson-NL/codex_register&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Jackson-NL/codex_register&type=Date" />
-</picture>
-
 ## 📄 免责声明
 
 本项目仅供学习与研究，用于理解浏览器自动化、反爬机制与系统架构设计。使用者应遵守目标服务的用户协议与当地法律法规，因使用本工具产生的任何后果由使用者自行承担。
+
+## 📈 Star History
+
+<!-- star-history:start -->
+<!-- star-history:end -->

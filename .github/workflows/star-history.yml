@@ -1,0 +1,24 @@
+name: Star History
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 每天 UTC 03:00（北京时间 11:00）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-history
+  cancel-in-progress: true
+
+jobs:
+  star-history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: narayann7/star-history-action@v1
+        with:
+          repos: ${{ github.repository }}
+          type: Date
+          themes: light,dark
