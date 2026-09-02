@@ -11,6 +11,7 @@ frontend/dist/
 # Debug / temporary artifacts
 debug_*.png
 debug_*.html
+*.bak_*
 _*.py
 _*.txt
 mail_dump.json

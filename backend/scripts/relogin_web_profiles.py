@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import re
 import shutil
@@ -30,7 +31,7 @@ if str(BACKEND) not in sys.path:
 
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
-from app.models import Account  # noqa: E402
+from app.models import Account, utcnow  # noqa: E402
 from app.services.browser_stack import build_launch_options  # noqa: E402
 from app.services.registrator import (  # noqa: E402
     CODE_INPUT_SELECTORS,
@@ -272,6 +273,86 @@ async def probe_authenticated_session(page) -> dict:
         return {"status": 0, "authenticated": False, "error": str(error)[:300]}
 
 
+async def extract_session_access_token(page, captured: str = "") -> dict:
+    """Return a ChatGPT web access_token without using OAuth/add-phone flows."""
+    token = str(captured or "").strip()
+    session: dict = {}
+    try:
+        session = await page.evaluate(
+            """
+            async () => {
+                try {
+                    const response = await fetch('/api/auth/session', {
+                        credentials: 'include',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const text = await response.text();
+                    let data = {};
+                    try { data = JSON.parse(text); } catch (e) {}
+                    return { status: response.status, data, body: text.slice(0, 240) };
+                } catch (e) {
+                    return { status: 0, data: {}, error: String(e) };
+                }
+            }
+            """
+        )
+    except Exception as error:  # noqa: BLE001
+        session = {"status": 0, "data": {}, "error": str(error)[:240]}
+    data = session.get("data") if isinstance(session, dict) else {}
+    if isinstance(data, dict):
+        for key in ("accessToken", "access_token", "token"):
+            value = data.get(key)
+            if isinstance(value, str) and value.count(".") == 2:
+                token = token or value.strip()
+                break
+    return {"access_token": token, "session": session}
+
+
+def jwt_claims(token: str) -> dict:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+def write_web_access_token(account_id: int, access_token: str, session_email: str = "") -> dict:
+    """Persist only the ChatGPT web AT/profile metadata; never writes RT/id_token."""
+    token = str(access_token or "").strip()
+    if not token:
+        raise RuntimeError("未提取到新的 access_token")
+    claims = jwt_claims(token)
+    auth_claims = claims.get("https://api.openai.com/auth", {}) if isinstance(claims, dict) else {}
+    profile_claims = claims.get("https://api.openai.com/profile", {}) if isinstance(claims, dict) else {}
+    db = SessionLocal()
+    try:
+        account = db.get(Account, account_id)
+        if not account:
+            raise RuntimeError(f"账号不存在: {account_id}")
+        account.access_token = token
+        account.account_id = (
+            auth_claims.get("chatgpt_account_id")
+            or profile_claims.get("chatgpt_account_id")
+            or account.account_id
+        )
+        account.plan_type = auth_claims.get("chatgpt_plan_type") or account.plan_type or "free"
+        if session_email and str(session_email).strip().lower() == str(account.email or "").strip().lower():
+            account.email = session_email
+        account.profile_last_used_at = utcnow()
+        if not account.profile_source or account.profile_source == "unknown":
+            account.profile_source = "web_relogin"
+        db.commit()
+        return {
+            "access_token_saved": True,
+            "account_id_saved": bool(account.account_id),
+            "plan_type": account.plan_type or "",
+        }
+    finally:
+        db.close()
+
+
+
 async def wait_for_stage(page, deadline: float) -> tuple[str, dict[str, str]]:
     while time.monotonic() < deadline:
         snapshot = await page_snapshot(page)
@@ -288,7 +369,15 @@ async def wait_for_stage(page, deadline: float) -> tuple[str, dict[str, str]]:
                 return "logged_in", snapshot
         if await has_visible(page, PASSWORD_INPUT_SELECTORS):
             return "password", snapshot
+        body_text = snapshot.get("body", "")
+        # Login may show an email inbox verification code first, with a
+        # "Continue with password" fallback. That code is not TOTP; do not
+        # fill the authenticator secret there. Prefer password flow.
+        if re.search(r"continue with password", body_text, re.I):
+            return "password_choice", snapshot
         if await has_visible(page, CODE_INPUT_SELECTORS):
+            if re.search(r"check your inbox|verification code we just sent|resend email", body_text, re.I):
+                return "email_code_blocked", snapshot
             return "totp", snapshot
         if await has_visible(page, EMAIL_SELECTORS):
             return "email", snapshot
@@ -314,6 +403,8 @@ async def login_account(account: Account, headless: bool, timeout_s: int, semaph
         }
         temp_profile: Path | None = None
         browser = None
+        access_token = ""
+        seen_auth_requests: list[str] = []
         try:
             if not account.email or not account.password or not account.totp_secret:
                 raise RuntimeError("本地账号缺少邮箱、密码或 TOTP")
@@ -329,6 +420,25 @@ async def login_account(account: Account, headless: bool, timeout_s: int, semaph
             async with AsyncCamoufox(**launch_options) as browser:
                 context = browser if launch_options.get("persistent_context") else await browser.new_context(locale="en-US")
                 page = context.pages[0] if context.pages else await context.new_page()
+
+                def on_request(request):
+                    nonlocal access_token, seen_auth_requests
+                    try:
+                        url = request.url or ""
+                        auth = request.headers.get("authorization", "")
+                    except Exception:
+                        return
+                    if "openai.com" in url or "chatgpt.com" in url:
+                        if auth.startswith("Bearer "):
+                            seen_auth_requests.append(safe_url(url))
+                            if not access_token:
+                                access_token = auth[len("Bearer "):].strip()
+                        elif len(seen_auth_requests) < 80:
+                            seen_auth_requests.append(f"{safe_url(url)} (no-auth)")
+                        if len(seen_auth_requests) > 80:
+                            seen_auth_requests.pop(0)
+
+                page.on("request", on_request)
                 result["stage"] = "open_login"
                 await page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
                 await wait_spa_ready(page, pause_ms=800)
@@ -350,6 +460,20 @@ async def login_account(account: Account, headless: bool, timeout_s: int, semaph
                         result["profile_session_status"] = int(snapshot.get("session_status") or 0)
                         result["profile_session_authenticated"] = True
                         result["profile_session_email"] = snapshot.get("session_email", "")
+                        token_info = await extract_session_access_token(page, access_token)
+                        access_token = str(token_info.get("access_token") or "").strip()
+                        if not access_token:
+                            token_deadline = time.monotonic() + 8.0
+                            while not access_token and time.monotonic() < token_deadline:
+                                await page.wait_for_timeout(400)
+                                token_info = await extract_session_access_token(page, access_token)
+                                access_token = str(token_info.get("access_token") or "").strip()
+                        if not access_token:
+                            diag = ", ".join(seen_auth_requests[-20:]) if seen_auth_requests else "无"
+                            raise RuntimeError(f"已登录但未提取到新的 access_token；观察到请求: {diag}")
+                        saved = write_web_access_token(account.id, access_token, str(snapshot.get("session_email") or ""))
+                        result.update(saved)
+                        result["access_token_captured"] = True
                         result["status"] = "success"
                         result["stage"] = "verified_home"
                         break
@@ -370,6 +494,23 @@ async def login_account(account: Account, headless: bool, timeout_s: int, semaph
                         submitted_email = True
                         await page.wait_for_timeout(800)
                         continue
+                    if stage == "password_choice":
+                        result["stage"] = "password_choice"
+                        clicked = False
+                        for locator in (page.get_by_text("Continue with password", exact=True), page.locator('text=Continue with password').first):
+                            try:
+                                if await locator.count() and await locator.is_visible():
+                                    await locator.click(timeout=5000)
+                                    clicked = True
+                                    break
+                            except Exception:
+                                continue
+                        if not clicked:
+                            raise RuntimeError("邮箱验证码页存在但无法点击 Continue with password")
+                        await page.wait_for_timeout(900)
+                        continue
+                    if stage == "email_code_blocked":
+                        raise RuntimeError("登录需要邮箱验证码，当前流程没有邮箱收码能力")
                     if stage == "password" and not submitted_password:
                         result["stage"] = "password"
                         if not await find_and_fill(page, PASSWORD_INPUT_SELECTORS, str(account.password)):
