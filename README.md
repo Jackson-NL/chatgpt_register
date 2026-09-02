@@ -5,25 +5,106 @@
 
 ---
 
-# chatgpt_register(一个Gmail  0.005)
+# 🚀 OpenAI / ChatGPT 全自动注册机 & Token 提取器
 
-批量注册 ChatGPT/Codex 账号并管理 OAuth 凭据的工具链。通过浏览器自动化完成邮箱/手机号注册，产出可导入 Sub2API 的 OAuth 会话凭据，附带账号维护、风控对抗与异常重登能力。
+![Python](https://img.shields.io/badge/Python-3.13+-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688?logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![Camoufox](https://img.shields.io/badge/Camoufox-0.4.11-F76D0D?logo=firefox&logoColor=white)
+![Playwright](https://img.shields.io/badge/Playwright-1.53-2EAD33?logo=playwright&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)
 
-## 技术栈
+这是一个高度自动化的 ChatGPT / Codex 账号注册与凭据管理工具链。项目通过 **Camoufox 指纹伪装浏览器**完成邮箱 / 手机号全自动注册流程，集成 **Cloudflare Turnstile 对抗**、**Clash 节点轮换**与 **SMSBower 接码**，并能拦截原生 OAuth2 授权流，直接提取出最核心的 `access_token` 和 `refresh_token`，产出可导入 Sub2API 的凭据，附带账号维护、异常重登与支付链接提取能力。
 
-| 层 | 选型 |
-|---|---|
-| 后端 | Python 3.13 + FastAPI 0.138 + Uvicorn 0.49 + SQLAlchemy 2.0 + SQLite |
-| 浏览器自动化 | Camoufox 0.4.11（指纹伪装）+ Playwright 1.53 |
-| 前端 | Vite 5 + React 18 + Tailwind 3 + react-router-dom 6 + recharts |
-| 临时邮箱 | Cloudflare Worker + KV（`cf-temp-mail`）|
-| 接码平台 | SMSBower（sms-activate 兼容协议）|
-| 代理 | Clash/Mihomo 控制器 API 自动轮换节点 |
+## ✨ 核心特性
 
-## 项目结构
+- 📷 **全自动邮箱注册**：Camoufox 在 `chatgpt.com` 走完整注册流程——临时邮箱接收验证码 → 设置密码 → 填写 about-you → OAuth 回调换取 token；支持批量注册，Gmail 订单模式下同一主邮箱可复用多个别名。
+- 📱 **手机号注册**：对接 SMSBower 接码平台自动取号，在 OAuth 流程中完成 add-phone 验证；支持单浏览器会话内换号重试，号码风控自动取消并重新取号。
+- 🔄 **Codex OAuth 重授权**：复用已登录浏览器 profile 走完整 PKCE 流程换取新 `refresh_token` / `id_token`；单账号与批量（并发 1~10）均支持，登录态失效时自动用本地邮箱/密码/TOTP 恢复登录。
+- ☁️ **Sub2API 集成**：注册成功的账号一键或自动推送到 Sub2API 管理端，按分组上传、状态校验、凭据同步；远端异常账号拉回本地重登后新凭据回写并恢复调度。
+- 🔗 **提链工作台**：选择已保存 token 的账号，复用 CS/OAICS Checkout、Stripe、PayPal/GoPay/GCash 提取逻辑，后台按并发执行；页面只展示凭据是否存在，不展示完整 `access_token`。
+- 🩺 **账号维护**：后台周期性用 `refresh_token` 刷新 AT/RT/ID Token，并调用 `wham/usage` 探测额度写回账号表。
+- 🏷️ **账号标签**：注册批次标签自动写入新账号，账号管理页支持标签筛选与批量设置/清除。
+
+## 🛡️ 风控对抗
+
+- 🎭 **浏览器指纹**：Camoufox + humanize + geoip + block_webrtc；视口/DPR/locale 在浏览器启动前随机生成并通过启动参数注入，时区由 geoip 按出口 IP 注入引擎层；启动后回读真实运行时指纹写日志核验（`[env] 实际指纹:`），杜绝"计划值 ≠ 实际值"的排查陷阱。
+- 🖱️ **行为层**：鼠标轨迹起点全视口随机、单一缓动曲线、与目标保持最小距离；姓名池 ~4.4 万组合避免按姓名聚类。
+- 🌐 **IP 层**：静默期节点轮换——仅当没有其他进行中注册时，新任务启动前自动切换 Clash 出口（并发下单 IP 承载账号数 ≤ 并发数）；失败路径保留异常触发轮换。
+- ☁️ **Cloudflare 宽限期**：检测到挑战页不立即失败，等待自动恢复后再继续。
+- 🚦 **页面状态机**：每步之间主动探测页面阶段，区分 Cloudflare 挑战 / OpenAI 错误页 / 账号停用（`account_deactivated` 秒级快速识别）/ 页面卡住。
+- ⏱️ **Gmail 订单超时保护**：连续 3 次验证码超时自动取消 SMSBower 订单。
+
+## 🔧 环境准备与安装
+
+1. **环境要求**：Python 3.13+、Node.js 18+、Camoufox 浏览器引擎（首次运行 `python -m camoufox fetch`）、Clash/Mihomo 代理、Cloudflare 账号 + 域名（部署临时邮箱 Worker）、SMSBower API Key。
+
+2. **克隆项目**：
+
+   ```bash
+   git clone https://github.com/Jackson-NL/codex_register.git
+   cd codex_register
+   ```
+
+3. **配置环境变量**：
+
+   ```powershell
+   cd backend
+   copy .env.example .env
+   ```
+
+   编辑 `.env`，至少填写：
+
+   - `SMSBOWER_API_KEY` — SMSBower 接码平台 API Key
+   - `DEFAULT_PROXY` — 本地代理地址（默认 `http://127.0.0.1:7890`）
+   - `CF_TEMP_EMAIL_BASE_URL` / `CF_TEMP_EMAIL_DOMAIN` — 已部署的 cf-temp-mail 地址
+   - `CF_TEMP_EMAIL_ADDRESS_MODE` — `generated` 自动创建地址，或 `custom_pool` 使用自定义邮箱池
+   - `CF_TEMP_EMAIL_CUSTOM_POOL` / `CF_TEMP_EMAIL_INBOX_ADDRESS` / `CF_TEMP_EMAIL_INBOX_JWT` — 自定义邮箱池地址、统一转发收件地址和收件凭证
+   - `SUB2API_BASE_URL` / `SUB2API_ADMIN_API_KEY` — Sub2API 管理端地址和凭据（如需上传）
+   - `SUB2API_REAUTH_REDIRECT_URI` — 可选的 Sub2API 远端 OAuth 回调地址；留空时使用 `${SUB2API_BASE_URL}/auth/callback`
+   - `CLASH_CONTROLLER_URL` / `CLASH_CONTROLLER_SECRET` — Clash 控制器地址和密钥
+   - `REGISTRATION_TAG` — 注册批次标签，自动写入新账号 `tag` 字段（可选）
+
+   完整配置项见 [backend/.env.example](backend/.env.example)。
+
+4. **安装依赖**：
+
+   ```powershell
+   # 后端
+   cd backend
+   pip install -r requirements.txt
+   python -m camoufox fetch
+
+   # 前端
+   cd ..\frontend
+   npm install
+   ```
+
+5. **部署临时邮箱 Worker**（cf-temp-mail）：详见 [cf-temp-mail/README.md](cf-temp-mail/README.md)。
+
+## 🚀 启动服务
+
+Windows 可直接双击根目录的 `start.bat`（默认重启占用 `8000/5173` 的旧服务，并等待健康检查），或在 PowerShell 中运行 `.\start.ps1`（保留已运行服务加 `-NoRestart`）。
+
+也可手动分别启动：
+
+```powershell
+# 后端（不要加 --reload，浏览器子进程需要稳定的事件循环）
+cd backend
+$env:PYTHONUTF8 = "1"
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 前端
+cd frontend
+npm run dev -- --host 127.0.0.1
+```
+
+访问 `http://127.0.0.1:5173/`，API 文档（Swagger UI）：`http://127.0.0.1:8000/docs`。
+
+## 🏗️ 项目结构
 
 ```
-chatgpt_register/
+codex_register/
 ├─ backend/                    FastAPI 后端
 │  ├─ app/
 │  │  ├─ main.py              应用入口 + lifespan
@@ -71,159 +152,7 @@ chatgpt_register/
 └─ skills/                    Agent 技能（Codex OAuth 重授权链路说明等）
 ```
 
-## 前置条件
-
-- Python 3.13+
-- Node.js 18+
-- Camoufox 浏览器引擎（首次运行 `python -m camoufox fetch`）
-- Clash/Mihomo 代理（用于注册和 OAuth 流程的 IP 轮换）
-- Cloudflare 账号 + 域名（部署 `cf-temp-mail` 临时邮箱 Worker）
-- SMSBower API Key（手机号注册 / 临时 Gmail 接码）
-
-## 快速开始
-
-### 1. 配置环境变量
-
-```powershell
-cd backend
-copy .env.example .env
-```
-
-编辑 `.env`，至少填写：
-
-- `SMSBOWER_API_KEY` — SMSBower 接码平台 API Key
-- `DEFAULT_PROXY` — 本地代理地址（默认 `http://127.0.0.1:7890`）
-- `CF_TEMP_EMAIL_BASE_URL` / `CF_TEMP_EMAIL_DOMAIN` — 已部署的 cf-temp-mail 地址
-- `CF_TEMP_EMAIL_ADDRESS_MODE` — `generated` 自动创建地址，或 `custom_pool` 使用自定义邮箱池
-- `CF_TEMP_EMAIL_CUSTOM_POOL` / `CF_TEMP_EMAIL_INBOX_ADDRESS` / `CF_TEMP_EMAIL_INBOX_JWT` — 自定义邮箱池地址、统一转发收件地址和收件凭证
-- `SUB2API_BASE_URL` / `SUB2API_ADMIN_API_KEY` — Sub2API 管理端地址和凭据（如需上传）
-- `SUB2API_REAUTH_REDIRECT_URI` — 可选的 Sub2API 远端 OAuth 回调地址；留空时使用 `${SUB2API_BASE_URL}/auth/callback`，重登不再占用本地 callback 端口。
-- `CLASH_CONTROLLER_URL` / `CLASH_CONTROLLER_SECRET` — Clash 控制器地址和密钥
-- `REGISTRATION_TAG` — 注册批次标签，自动写入新账号 `tag` 字段（可选）
-
-完整配置项见 [backend/.env.example](backend/.env.example)。
-
-### 2. 安装依赖
-
-```powershell
-# 后端
-cd backend
-pip install -r requirements.txt
-python -m camoufox fetch
-
-# 前端
-cd ..\frontend
-npm install
-```
-
-### 3. 部署临时邮箱 Worker（cf-temp-mail）
-
-详见 [cf-temp-mail/README.md](cf-temp-mail/README.md)。
-
-### 4. 启动服务
-
-Windows 可直接双击根目录的 `start.bat`（默认重启占用 `8000/5173` 的旧服务，并等待健康检查）：
-
-```bat
-start.bat
-```
-
-也可在 PowerShell 中直接运行启动实现：
-
-```powershell
-.\start.ps1
-```
-
-如需保留已运行服务，使用 `./start.ps1 -NoRestart`。
-
-后端（不要加 `--reload`，浏览器子进程需要稳定的事件循环）：
-
-```powershell
-cd backend
-$env:PYTHONUTF8 = "1"
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-前端：
-
-```powershell
-cd frontend
-npm run dev -- --host 127.0.0.1
-```
-
-访问 `http://127.0.0.1:5173/`。
-
-## 核心功能
-
-### 邮箱注册
-
-通过 Camoufox 浏览器在 `chatgpt.com` 完成邮箱注册流程：临时邮箱接收验证码 → 设置密码 → 填写 about-you → OAuth 回调换取 token。支持批量注册；Gmail 订单模式下同一主邮箱可复用多个别名。
-
-### 手机号注册
-
-通过 SMSBower 接码平台获取手机号，在 OAuth 流程中完成 add-phone 验证。支持单浏览器会话内换号重试，遇到号码风控自动取消并重新取号。
-
-### 风控对抗
-
-- **浏览器指纹**：Camoufox + humanize + geoip + block_webrtc；视口/DPR/locale 在浏览器启动前随机生成并通过启动参数注入（含持久化 profile 路径），时区由 geoip 按出口 IP 注入引擎层；启动后读取真实运行时指纹写日志核验（`[env] 实际指纹:`），杜绝"计划值 ≠ 实际值"的排查陷阱
-- **行为层**：鼠标轨迹起点全视口随机、单一缓动曲线、与目标保持最小距离；姓名池 ~4.4 万组合避免按姓名聚类
-- **IP 层**：静默期节点轮换——仅当没有其他进行中注册时，新任务启动前自动切换 Clash 出口（并发下单 IP 承载账号数 ≤ 并发数）；失败路径保留原有的异常触发轮换
-- **Cloudflare 宽限期**：检测到挑战页不立即失败，等待自动恢复后再继续
-- **页面状态机**：每步之间主动探测页面阶段，区分 Cloudflare 挑战 / OpenAI 错误页 / 账号停用（`account_deactivated` 秒级快速识别，不再白等超时）/ 页面卡住
-- **Gmail 订单超时保护**：连续 3 次验证码超时自动取消 SMSBower 订单
-
-### 账号标签
-
-- 每个账号带独立 `tag` 字段；设置 → 通用 → 「注册批次标签」配置后自动写入新账号
-- 账号管理页支持标签列展示、按标签筛选、勾选后批量设置/清除标签
-
-### 账号维护
-
-后台周期性维护带 `refresh_token` 的账号：
-
-1. 用 RT 调用 `https://auth.openai.com/oauth/token` 刷新 AT/RT/ID Token
-2. 用新 AT 调用 `https://chatgpt.com/backend-api/wham/usage` 探测额度
-3. 将刷新状态和额度写回账号表
-
-```http
-GET  /api/settings      # 运行时配置读写
-POST /api/accounts/bulk-tag
-```
-
-另提供独立脚本 `backend/scripts/refresh_rt_all.py`：一次性批量刷新全部带 RT 账号并输出过期统计报告。
-
-### Codex OAuth 重授权
-
-复用已登录的浏览器 profile 走完整 PKCE OAuth 流程获取新的 `refresh_token` / `id_token`：
-
-- 单账号：`POST /api/accounts/{id}/oauth/refresh-from-profile`
-- 批量：`POST /api/accounts/oauth/jobs`（并发 1~10，支持 add-phone 短信兜底）
-- 登录态失效时自动用本地邮箱/密码/TOTP 恢复登录；MFA 缺 secret 视为硬失败
-- 详细流程见 `skills/codex-oauth-reauthorization/SKILL.md`
-
-### Sub2API 上传 / 异常重登
-
-- 注册成功的账号一键或自动推送到 Sub2API 管理端，按分组上传、状态校验、凭据同步，产出格式兼容 `import-codex-session`
-- 从 Sub2API 拉取异常账号列表，使用本地 profile + Camoufox 重新走 OAuth 登录，新凭据回写远端并恢复调度
-
-### 提链工作台
-
-选择已保存 access token 的账号，复用 CS/OAICS Checkout、Stripe 和 PayPal/GoPay/GCash 提取逻辑，后台按并发数执行并持续保存阶段、日志和结果。页面只展示凭据是否存在，不展示完整 access token。
-
-主要接口：
-
-```http
-GET  /api/link-extraction/accounts
-POST /api/link-extraction/jobs
-GET  /api/link-extraction/jobs/{job_id}
-GET  /api/link-extraction/jobs/{job_id}/items
-GET  /api/link-extraction/jobs/{job_id}/logs
-POST /api/link-extraction/jobs/{job_id}/cancel
-```
-
-## API 概览
-
-API 文档（Swagger UI）：`http://127.0.0.1:8000/docs`
+## 📡 API 概览
 
 | 前缀 | 模块 | 功能 |
 |---|---|---|
@@ -240,7 +169,7 @@ API 文档（Swagger UI）：`http://127.0.0.1:8000/docs`
 | `/api/stats` | stats | 仪表盘统计 |
 | `/api/tasks` | tasks | 任务查询 |
 
-## 数据模型
+## 🗃️ 数据模型
 
 | 表 | 说明 |
 |---|---|
@@ -257,7 +186,7 @@ API 文档（Swagger UI）：`http://127.0.0.1:8000/docs`
 
 旧数据库启动时自动 `ALTER TABLE` 补齐新字段，无需手动迁移。
 
-## 测试
+## 🧪 测试
 
 ```powershell
 # 后端
@@ -269,7 +198,7 @@ npm test -- --test-reporter=dot
 npm run build
 ```
 
-## 排错
+## 🩺 排错
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -284,7 +213,7 @@ npm run build
 | OTP 未收到 | 接码平台延迟/号码被回收 | resend 或取消换号 |
 | `响应中缺少 access_token` | OAuth token endpoint 未返回 AT | 检查 OAuth 流程是否完整 |
 
-## 注意事项
+## ⚠️ 注意事项
 
 - 后端**不要**使用 `--reload` 启动，浏览器自动化和 Gmail 子进程需要稳定的事件循环。
 - 日志默认以明文存储（含密码/验证码/TOTP），便于排查。可通过 API `POST /api/registrations/log-redact` 临时开启脱敏。
@@ -292,6 +221,6 @@ npm run build
 - API 当前无鉴权，CORS 全开（`allow_origins=["*"]`），仅适用于本地内网环境，不要暴露到公网。
 - `data/`、`profiles/`、`.env`、`output/` 均已在 `.gitignore` 中排除，请勿提交到公共仓库。
 
-## 免责声明
+## 📄 免责声明
 
 本项目仅供学习与研究，用于理解浏览器自动化、反爬机制与系统架构设计。使用者应遵守目标服务的用户协议与当地法律法规，因使用本工具产生的任何后果由使用者自行承担。
