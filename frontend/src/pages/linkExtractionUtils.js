@@ -6,6 +6,23 @@ export const DEFAULT_LINK_EXTRACTION_FORM = {
   apply_checkout_update: true,
   oaics_only: false,
   concurrency: 2,
+  max_attempts: 6,
+  rotate_proxy: true,
+  browser_fallback: true,
+  require_zero_amount: false,
+  checkout_region: "",
+  update_region: "",
+  promo_campaign_id: "",
+};
+
+// 印尼 0 元模板：ID 出口建 checkout（IDR + GoPay），TH 出口做优惠 update，金额必须为 0
+export const INDONESIA_ZERO_PRESET = {
+  country: "ID",
+  payment_method: "gopay",
+  apply_checkout_update: true,
+  require_zero_amount: true,
+  checkout_region: "ID",
+  update_region: "TH",
 };
 
 export const LINK_COUNTRIES = [
@@ -32,8 +49,14 @@ export const LINK_PAYMENT_METHODS = [
   { value: "gcash", label: "GCash" },
 ];
 
+export function normalizeRegion(value) {
+  const text = String(value || "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(text) ? text : "";
+}
+
 export function normalizeLinkForm(form = {}) {
   const concurrency = Number(form.concurrency);
+  const maxAttempts = Number(form.max_attempts);
   return {
     ...DEFAULT_LINK_EXTRACTION_FORM,
     ...form,
@@ -42,6 +65,13 @@ export function normalizeLinkForm(form = {}) {
     concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.min(5, Math.trunc(concurrency))) : 2,
     apply_checkout_update: form.apply_checkout_update == null ? true : Boolean(form.apply_checkout_update),
     oaics_only: Boolean(form.oaics_only),
+    max_attempts: Number.isFinite(maxAttempts) ? Math.max(1, Math.min(20, Math.trunc(maxAttempts))) : 6,
+    rotate_proxy: form.rotate_proxy == null ? true : Boolean(form.rotate_proxy),
+    browser_fallback: form.browser_fallback == null ? true : Boolean(form.browser_fallback),
+    require_zero_amount: Boolean(form.require_zero_amount),
+    checkout_region: normalizeRegion(form.checkout_region),
+    update_region: normalizeRegion(form.update_region),
+    promo_campaign_id: String(form.promo_campaign_id || "").trim(),
   };
 }
 

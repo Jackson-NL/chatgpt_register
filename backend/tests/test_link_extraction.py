@@ -11,11 +11,53 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app.models import Account, LinkExtractionItem
 from app.services import link_extraction as module
-from app.services.link_extraction import LinkExtractionService
-from app.services.payment_link_extractor.errors import ExtractionCancelled
+from app.services.link_extraction import LinkExtractionService, _classify_failure
+from app.services.link_proxies import (
+    apply_proxy_region,
+    is_cliproxy_session,
+    proxy_region,
+    rotate_proxy_sid,
+)
+from app.services.payment_link_extractor.errors import (
+    ConfigurationError,
+    ExtractionCancelled,
+    NetworkError,
+    ProtocolError,
+)
 from app.services.payment_link_extractor.models import PaymentLinkResult
 from app.services.payment_link_extractor.config import billing_for_country
 from app.services.payment_link_extractor.transport import normalize_proxy_url
+
+
+class LinkProxyHelpersTests(unittest.TestCase):
+    CLIPROXY = "http://qq3d1222947-region-Rand-sid-mA9UyxmG-t-5:nhedctnw@sg.cliproxy.io:443"
+
+    def test_rotate_sid_changes_session(self):
+        first = rotate_proxy_sid(self.CLIPROXY)
+        second = rotate_proxy_sid(first)
+        self.assertIn("@sg.cliproxy.io:443", first)
+        self.assertNotEqual(first.split("-sid-")[1], second.split("-sid-")[1])
+        self.assertIn("-t-5", first)
+
+    def test_apply_region_overrides_rand(self):
+        rewritten = apply_proxy_region(self.CLIPROXY, "id")
+        self.assertIn("-region-ID-", rewritten)
+        self.assertEqual(proxy_region(rewritten), "ID")
+
+    def test_non_cliproxy_passthrough(self):
+        plain = "http://user:pass@example.com:8080"
+        self.assertEqual(rotate_proxy_sid(plain), plain)
+        self.assertEqual(apply_proxy_region(plain, "ID"), plain)
+        self.assertFalse(is_cliproxy_session(plain))
+
+    def test_classify_failure_categories(self):
+        self.assertEqual(_classify_failure(ProtocolError(502, "Stripe init failed: boom")), "stripe")
+        self.assertEqual(_classify_failure(ProtocolError(403, "checkout create failed: unusual activity")), "risk")
+        self.assertEqual(_classify_failure(ProtocolError(401, "token expired")), "fatal")
+        self.assertEqual(_classify_failure(ConfigurationError("bad country")), "fatal")
+        self.assertEqual(_classify_failure(ProtocolError(409, "promo eligibility rejected: state=ineligible")), "fatal")
+        self.assertEqual(_classify_failure(ProtocolError(403, 'checkout/update failed: {"detail":"This promotion is not available."}')), "promo_region")
+        self.assertEqual(_classify_failure(NetworkError("checkout", "timed out")), "network")
 
 
 class LinkExtractionServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -120,6 +162,176 @@ class LinkExtractionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.status, "canceled")
         self.assertEqual(db.get(module.LinkExtractionJob, job.id).status, "canceled")
         db.close()
+
+    async def test_retry_rotates_cliproxy_sid_then_succeeds(self):
+        seen_configs = []
+
+        def extractor(config, *, cancel_event, stage_callback, log_callback):
+            seen_configs.append(config.checkout_proxy)
+            if len(seen_configs) < 3:
+                raise ProtocolError(403, "checkout create failed: unusual activity")
+            return self._result(config)
+
+        proxy = "http://qq3d1222947-region-Rand-sid-AAAA1111-t-5:pw@sg.cliproxy.io:443"
+        service = LinkExtractionService(extractor=extractor)
+        db = self.session_factory()
+        job = await service.create_job(
+            SimpleNamespace(account_ids=[1], country="GB", payment_method="paypal", concurrency=1, checkout_proxy=proxy),
+            db,
+        )
+        db.close()
+        service.start_job(job.id)
+        await module._JOBS[job.id]
+
+        db = self.session_factory()
+        self.assertEqual(db.get(LinkExtractionItem, 1).status, "succeeded")
+        self.assertEqual(len(seen_configs), 3)
+        sids = {config.split("-sid-", 1)[1].split(":")[0] for config in seen_configs}
+        self.assertEqual(len(sids), 3, "每次重试都应轮换出新的 cliproxy sid")
+        db.close()
+
+    async def test_stripe_failure_switches_to_browser_factory(self):
+        calls = []
+        sentinel_factory = object()
+
+        def extractor(config, *, cancel_event, stage_callback, log_callback, transport_factory=None):
+            calls.append(transport_factory)
+            if len(calls) == 1:
+                raise ProtocolError(502, "Stripe init failed: no setup_intent")
+            return self._result(config)
+
+        with patch.object(module, "BrowserExtractionContext") as context_mock:
+            context_mock.return_value.__enter__.return_value = sentinel_factory
+            service = LinkExtractionService(extractor=extractor)
+            db = self.session_factory()
+            job = await service.create_job(
+                SimpleNamespace(account_ids=[1], country="GB", payment_method="paypal", concurrency=1),
+                db,
+            )
+            db.close()
+            service.start_job(job.id)
+            await module._JOBS[job.id]
+
+        db = self.session_factory()
+        self.assertEqual(db.get(LinkExtractionItem, 1).status, "succeeded")
+        db.close()
+        self.assertEqual(calls, [None, sentinel_factory])
+
+    async def test_fatal_error_does_not_retry(self):
+        attempts = []
+
+        def extractor(config, *, cancel_event, stage_callback, log_callback):
+            attempts.append(1)
+            raise ProtocolError(409, "promo eligibility rejected: state=ineligible")
+
+        service = LinkExtractionService(extractor=extractor)
+        db = self.session_factory()
+        job = await service.create_job(
+            SimpleNamespace(account_ids=[1], country="GB", payment_method="paypal", concurrency=1, max_attempts=5),
+            db,
+        )
+        db.close()
+        service.start_job(job.id)
+        await module._JOBS[job.id]
+
+        db = self.session_factory()
+        row = db.get(LinkExtractionItem, 1)
+        self.assertEqual(row.status, "failed")
+        self.assertIn("promo eligibility", row.error)
+        db.close()
+        self.assertEqual(len(attempts), 1)
+
+    async def test_require_zero_amount_fails_nonzero_result(self):
+        def extractor(config, *, cancel_event, stage_callback, log_callback):
+            return self._result(config)
+
+        service = LinkExtractionService(extractor=extractor)
+        db = self.session_factory()
+        job = await service.create_job(
+            SimpleNamespace(account_ids=[1], country="GB", payment_method="paypal", concurrency=1, require_zero_amount=True),
+            db,
+        )
+        db.close()
+        service.start_job(job.id)
+        await module._JOBS[job.id]
+
+        db = self.session_factory()
+        row = db.get(LinkExtractionItem, 1)
+        self.assertEqual(row.status, "failed")
+        self.assertIn("优惠后金额非 0", row.error)
+        db.close()
+
+    async def test_region_rewrite_applied_per_attempt(self):
+        seen = []
+
+        def extractor(config, *, cancel_event, stage_callback, log_callback):
+            seen.append((config.checkout_proxy, config.update_proxy))
+            return self._result(config)
+
+        proxy = "http://qq3d1222947-region-Rand-sid-AAAA1111-t-5:pw@sg.cliproxy.io:443"
+        service = LinkExtractionService(extractor=extractor)
+        db = self.session_factory()
+        job = await service.create_job(
+            SimpleNamespace(
+                account_ids=[1],
+                country="ID",
+                payment_method="gopay",
+                concurrency=1,
+                checkout_proxy=proxy,
+                checkout_region="ID",
+                update_region="TH",
+                rotate_proxy=False,
+            ),
+            db,
+        )
+        db.close()
+        service.start_job(job.id)
+        await module._JOBS[job.id]
+
+        checkout_proxy, update_proxy = seen[0]
+        self.assertIn("-region-ID-", checkout_proxy)
+        self.assertIn("-region-TH-", update_proxy)
+        self.assertNotEqual(
+            checkout_proxy.split("-sid-")[1],
+            update_proxy.split("-sid-")[1],
+            "update 出口应从 checkout 派生并使用独立 sid",
+        )
+
+    async def test_promo_region_fallback_switches_update_region(self):
+        seen = []
+
+        def extractor(config, *, cancel_event, stage_callback, log_callback):
+            seen.append(config.update_proxy)
+            if len(seen) == 1:
+                raise ProtocolError(403, 'checkout/update failed: {"detail":"This promotion is not available."}')
+            return self._result(config)
+
+        proxy = "http://qq3d1222947-region-Rand-sid-AAAA1111-t-5:pw@sg.cliproxy.io:443"
+        service = LinkExtractionService(extractor=extractor)
+        db = self.session_factory()
+        job = await service.create_job(
+            SimpleNamespace(
+                account_ids=[1],
+                country="ID",
+                payment_method="gopay",
+                concurrency=1,
+                checkout_proxy=proxy,
+                checkout_region="ID",
+                update_region="TH",
+                rotate_proxy=False,
+            ),
+            db,
+        )
+        db.close()
+        service.start_job(job.id)
+        await module._JOBS[job.id]
+
+        db = self.session_factory()
+        self.assertEqual(db.get(LinkExtractionItem, 1).status, "succeeded")
+        db.close()
+        self.assertEqual(len(seen), 2)
+        self.assertIn("-region-TH-", seen[0], "第一次 update 走配置的 TH 出口")
+        self.assertIn("-region-ID-", seen[1], "被拒后回退 checkout 同出口（ID）")
 
 
 if __name__ == "__main__":

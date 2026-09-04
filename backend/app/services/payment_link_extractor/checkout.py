@@ -5,8 +5,8 @@ import re
 from typing import Any
 
 from .config import DEFAULT_TIMEOUT, processor_entity_for_country
-from .errors import ConfigurationError, ProtocolError
-from .logging_utils import safe_log_text
+from .errors import ConfigurationError, NetworkError, ProtocolError
+from .logging_utils import emit_log, safe_log_text
 from .models import CheckoutData, ExtractionConfig
 from .transport import response_json, set_proxy_url, stage_http_request
 
@@ -121,10 +121,76 @@ def merge_checkout_payload(checkout: CheckoutData, payload: dict[str, Any]) -> N
             checkout[key] = value
 
 
+def resolve_promo_campaign(
+    config: ExtractionConfig,
+    chatgpt: Any,
+    log: Any | None,
+) -> str:
+    """确定本次提链使用的优惠 campaign id；空串表示无优惠。
+
+    显式配置 ``config.promo_campaign_id`` 时直接使用；否则读取账号活动目录
+    （accounts/check）里 ``eligible_promo_campaigns.plus.id``。check_coupon
+    接口的 ``eligible`` 只表示券码存在，不代表账号被活动定向，不作为依据。
+    """
+    explicit = str(getattr(config, "promo_campaign_id", "") or "").strip()
+    if explicit:
+        emit_log(log, f"使用显式优惠活动: {explicit}")
+        return explicit
+    return fetch_promo_campaign(config, chatgpt, log)
+
+
+def fetch_promo_campaign(
+    config: ExtractionConfig,
+    chatgpt: Any,
+    log: Any | None,
+) -> str:
+    """读取账号活动目录，返回 plus 的专属优惠 campaign id；账号无优惠时返回空串。"""
+    path = "/backend-api/accounts/check/v4-2023-04-27"
+    try:
+        response = stage_http_request(
+            chatgpt,
+            "Promo campaign catalog",
+            "GET",
+            f"https://chatgpt.com{path}",
+            log,
+            headers={
+                "Referer": "https://chatgpt.com/",
+                "x-openai-target-path": path,
+                "x-openai-target-route": path,
+            },
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except NetworkError as exc:
+        emit_log(log, f"Promo campaign catalog network error (按无优惠继续): {exc.detail}")
+        return ""
+    if response.status_code >= 400:
+        emit_log(log, f"Promo campaign catalog HTTP {response.status_code} (按无优惠继续)")
+        return ""
+    try:
+        payload = response_json(response, "Promo campaign catalog")
+    except ProtocolError:
+        emit_log(log, "Promo campaign catalog invalid json (按无优惠继续)")
+        return ""
+    accounts = payload.get("accounts") or {}
+    if not isinstance(accounts, dict):
+        return ""
+    for item in accounts.values():
+        if not isinstance(item, dict):
+            continue
+        plus = item.get("eligible_promo_campaigns") or {}
+        plus = plus.get("plus") if isinstance(plus, dict) else {}
+        if isinstance(plus, dict):
+            campaign_id = str(plus.get("id") or plus.get("campaign_id") or "").strip()
+            if campaign_id:
+                return campaign_id
+    return ""
+
+
 def create_checkout(
     config: ExtractionConfig,
     chatgpt: Any,
     log: Any | None,
+    promo_campaign_id: str = "",
 ) -> CheckoutData:
     path = "/backend-api/payments/checkout"
     body = {
@@ -133,6 +199,12 @@ def create_checkout(
         "billing_details": {"country": config.country.upper(), "currency": config_currency(config)},
         "checkout_ui_mode": "custom",
     }
+    promo_campaign_id = str(promo_campaign_id or "").strip()
+    if promo_campaign_id:
+        body["promo_campaign"] = {
+            "promo_campaign_id": promo_campaign_id,
+            "is_coupon_from_query_param": False,
+        }
     response = stage_http_request(
         chatgpt,
         "ChatGPT checkout",
@@ -222,11 +294,13 @@ def update_checkout(
         "plan_name": "chatgptplusplan",
         "price_interval": "month",
         "seat_quantity": 1,
-        "promo_campaign": {
-            "promo_campaign_id": "plus-1-month-free",
-            "is_coupon_from_query_param": False,
-        },
     }
+    promo_campaign_id = str(checkout.get("promo_campaign_id") or "").strip()
+    if promo_campaign_id:
+        body["promo_campaign"] = {
+            "promo_campaign_id": promo_campaign_id,
+            "is_coupon_from_query_param": False,
+        }
     set_proxy_url(chatgpt, config.update_proxy)
     try:
         response = stage_http_request(

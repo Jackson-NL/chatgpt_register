@@ -90,8 +90,12 @@ def billing_dict_for_country(country: str) -> dict[str, str]:
 
 
 def currency_minor_scale(currency: str) -> int:
-    """Return the number of decimal places for display conversion."""
-    return 0 if str(currency or "").upper() in {"JPY", "IDR"} else 2
+    """Decimal places used by OpenAI checkout for ``minorUnitsAmount``.
+
+    OpenAI/Stripe 侧对 IDR/JPY 这类零小数币种也统一按 2 位小数上报
+    （IDR 349,000 会返回 34,900,000），所以显示换算一律用 2 位。
+    """
+    return 2
 
 
 def normalize_payment_method(value: str) -> str:

@@ -51,6 +51,7 @@ class Sub2APIClientReloginTests(unittest.IsolatedAsyncioTestCase):
                             "id": 17,
                             "name": "owner@example.com|stored",
                             "credentials": {"email": "Owner@Example.com", "totp_secret": "LOCAL-SECRET"},
+                            "proxy_id": 127,
                             "group_ids": [2, 3, 2],
                             "status": "token_expired",
                             "last_error": {"message": "refresh failed"},
@@ -64,6 +65,7 @@ class Sub2APIClientReloginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts[0]["email"], "owner@example.com")
         self.assertEqual(accounts[0]["group_ids"], [2, 3])
         self.assertEqual(accounts[0]["totp_secret"], "LOCAL-SECRET")
+        self.assertEqual(accounts[0]["proxy_id"], 127)
         self.assertTrue(is_sub2api_error_account(accounts[0]))
 
     async def test_request_reauth_url_falls_back_to_available_endpoint(self):
@@ -81,6 +83,21 @@ class Sub2APIClientReloginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["session_id"], "session-1")
         self.assertEqual(result["state"], "")
         self.assertEqual(calls[2][1], "https://sub2api.example/api/v1/admin/openai/accounts/remote%2F1/generate-auth-url")
+
+    async def test_reauth_endpoints_forward_remote_proxy_id(self):
+        calls = []
+
+        async def request(method, url, headers, json=None):
+            calls.append((method, url, json))
+            return FakeResponse(200, {"data": {"auth_url": "https://auth.example/?state=s1", "session_id": "session-1"}})
+
+        client = Sub2APIClient(base_url="https://sub2api.example", admin_api_key="key", request=request)
+        await client.request_reauth_url("17", "http://localhost:1455/auth/callback", proxy_id=127)
+        self.assertEqual(calls[0][2]["proxy_id"], 127)
+
+        calls.clear()
+        await client.exchange_reauth_code("session-1", "code-1", "s1", proxy_id=127)
+        self.assertEqual(calls[0][2]["proxy_id"], 127)
 
     async def test_apply_credentials_falls_back_without_echoing_credentials(self):
         calls = []
@@ -225,6 +242,7 @@ class Sub2APIReloginServiceTests(unittest.IsolatedAsyncioTestCase):
         preview_items = [
             {
                 "remote_id": "r-1",
+                "proxy_id": "127",
                 "email": "owner@example.com",
                 "status": "error",
                 "error_text": "token expired",
@@ -253,6 +271,7 @@ class Sub2APIReloginServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.total, 1)
         self.assertEqual(job.pending, 1)
         self.assertEqual([item.remote_account_id for item in items], ["r-1"])
+        self.assertEqual(items[0].proxy_id, 127)
 
     async def test_create_job_does_not_rescan_when_preview_has_no_error_items(self):
         class NoRescanClient:
@@ -300,26 +319,33 @@ class Sub2APIReloginServiceTests(unittest.IsolatedAsyncioTestCase):
             db.commit()
             db.close()
 
+            instances = []
+
             class FakeClient:
                 def __init__(self):
                     self.applied = []
+                    self.proxy_calls = []
+                    instances.append(self)
 
                 async def list_accounts(self, group_ids):
                     return [
-                        {"remote_id": "r-ok", "email": "owner@example.com", "name": "ok", "group_ids": [42], "status": "error", "error_text": "expired"},
-                        {"remote_id": "r-fail", "email": "owner@example.com", "name": "fail", "group_ids": [42], "status": "error", "error_text": "expired"},
+                        {"remote_id": "r-ok", "email": "owner@example.com", "name": "ok", "proxy_id": 127, "group_ids": [42], "status": "error", "error_text": "expired"},
+                        {"remote_id": "r-fail", "email": "owner@example.com", "name": "fail", "proxy_id": 127, "group_ids": [42], "status": "error", "error_text": "expired"},
                     ]
 
                 async def request_reauth_url(self, account_id, redirect_uri, proxy_id=None):
+                    self.proxy_calls.append(("request", account_id, proxy_id))
                     return {"auth_url": f"https://auth.example/?state={account_id}", "session_id": account_id, "state": account_id, "endpoint": "reauth"}
 
                 async def exchange_reauth_code(self, session_id, code, state, proxy_id=None):
+                    self.proxy_calls.append(("exchange", session_id, proxy_id))
                     if session_id == "r-fail":
                         raise Sub2APIError("exchange failed")
                     return {"access_token": "AT_TEST", "refresh_token": "RT_TEST"}
 
                 async def apply_reauth_credentials(self, account_id, credentials, extra=None, proxy_id=None):
                     self.applied.append(account_id)
+                    self.proxy_calls.append(("apply", account_id, proxy_id))
                     return {"endpoint": "apply"}
 
                 async def clear_error(self, account_id):
@@ -350,6 +376,11 @@ class Sub2APIReloginServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((profile_dir / "r-fail.txt").exists())
             self.assertTrue(captured_profiles)
             self.assertTrue(all(not path.exists() for path in captured_profiles))
+            run_client = instances[-1]
+            self.assertEqual(
+                run_client.proxy_calls,
+                [("request", "r-ok", 127), ("exchange", "r-ok", 127), ("apply", "r-ok", 127), ("request", "r-fail", 127), ("exchange", "r-fail", 127)],
+            )
 
     async def test_one_item_failure_does_not_stop_other_items(self):
         remote = [self._remote_accounts()[0]]

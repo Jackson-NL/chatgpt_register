@@ -15,6 +15,10 @@ class ExtractionConfig:
     apply_checkout_update: bool = True
     verbose: bool = True
     oaics_only: bool = False
+    # 显式指定优惠活动 id 时跳过账号目录预检；为空则自动预检
+    promo_campaign_id: str = ""
+    # 0 元校验：账号目录无可用优惠活动时快速失败，不进入提链主流程
+    require_zero_amount: bool = False
 
 
 @dataclass(frozen=True)

@@ -341,6 +341,55 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][2]["x-api-key"], "admin-key")
         self.assertNotIn("authorization", calls[0][2])
 
+    async def test_import_codex_session_accepts_access_token_only_and_returns_remote_id(self):
+        calls = []
+
+        async def request(method, url, headers, json=None):
+            calls.append((method, url, headers, json))
+            return FakeResponse(200, {"code": 0, "data": {
+                "total": 1,
+                "created": 1,
+                "updated": 0,
+                "failed": 0,
+                "items": [{"index": 1, "action": "created", "account_id": 9001}],
+                "warnings": [{"index": 1, "message": "未包含 refresh_token"}],
+            }})
+
+        client = Sub2APIClient(
+            base_url="https://sub2api.example",
+            admin_api_key="admin-key",
+            request=request,
+        )
+
+        result = await client.import_codex_session("at-only", [42, 42], concurrency=8, name="person@example.com")
+
+        self.assertEqual(result["remote_id"], "9001")
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(result["warnings"], ["未包含 refresh_token"])
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "https://sub2api.example/api/v1/admin/accounts/import/codex-session")
+        self.assertEqual(calls[0][3]["content"], "at-only")
+        self.assertEqual(calls[0][3]["group_ids"], [42])
+        self.assertEqual(calls[0][3]["concurrency"], 8)
+        self.assertEqual(calls[0][3]["load_factor"], 8)
+        self.assertTrue(calls[0][3]["update_existing"])
+
+    async def test_import_codex_session_reports_sub2api_failed_item(self):
+        async def request(method, url, headers, json=None):
+            return FakeResponse(200, {"code": 0, "data": {
+                "total": 1,
+                "created": 0,
+                "updated": 0,
+                "failed": 1,
+                "items": [{"index": 1, "action": "failed", "message": "access_token 已过期"}],
+            }})
+
+        client = Sub2APIClient(base_url="https://sub2api.example", jwt="jwt", request=request)
+
+        with self.assertRaises(Sub2APIError) as context:
+            await client.import_codex_session("expired-at", 42)
+        self.assertIn("access_token 已过期", str(context.exception))
+
     async def test_upload_returns_safe_summary_without_credentials(self):
         calls = []
 
@@ -490,12 +539,36 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
         self.assertIn("access_token", result["errors"][0]["error"])
 
-    async def test_upload_skips_accounts_without_refresh_or_id_token_before_remote_create(self):
+    async def test_uploads_access_token_only_via_codex_session_import(self):
         calls = []
 
         async def request(method, url, headers, json=None):
             calls.append((method, url, headers, json))
-            return FakeResponse(201, {"code": 0, "data": {"id": 9001}})
+            if method == "POST" and url.endswith("/api/v1/admin/accounts/import/codex-session"):
+                return FakeResponse(200, {"code": 0, "data": {
+                    "total": 1,
+                    "created": 1,
+                    "updated": 0,
+                    "failed": 0,
+                    "items": [{"index": 1, "action": "created", "account_id": 9001}],
+                    "warnings": [{"index": 1, "message": "未包含 refresh_token"}],
+                }})
+            if method == "GET" and url.endswith("/api/v1/admin/accounts/9001"):
+                return FakeResponse(200, {"code": 0, "data": {
+                    "id": 9001,
+                    "name": "missing-refresh@example.com",
+                    "platform": "openai",
+                    "type": "oauth",
+                    "group_ids": [42],
+                    "concurrency": 3,
+                    "load_factor": 3,
+                    "credentials_status": {
+                        "has_access_token": True,
+                        "has_refresh_token": False,
+                        "has_id_token": False,
+                    },
+                }})
+            return FakeResponse(404, {"code": 404})
 
         account = Account(
             id=23,
@@ -509,10 +582,16 @@ class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
 
         result = await client.upload_accounts([account], 42)
 
-        self.assertEqual(result["success"], 0)
-        self.assertEqual(result["failed"], 1)
-        self.assertEqual(calls, [])
-        self.assertIn("refresh_token", result["errors"][0]["error"])
+        self.assertEqual(result["success"], 1)
+        self.assertEqual(result["failed"], 0)
+        import_call = next(call for call in calls if call[0] == "POST" and call[1].endswith("/import/codex-session"))
+        self.assertEqual(import_call[3]["content"], "access-token-only")
+        self.assertEqual(import_call[3]["group_ids"], [42])
+        self.assertEqual(import_call[3]["concurrency"], 3)
+        self.assertEqual(import_call[3]["load_factor"], 3)
+        self.assertEqual(result["results"][0]["remote_id"], "9001")
+        self.assertFalse(result["results"][0]["has_refresh_token"])
+        self.assertFalse(any(call[1].endswith("/api/v1/admin/accounts") for call in calls))
 
 
     async def test_upload_updates_existing_remote_oauth_account_with_missing_access_token(self):
@@ -1067,10 +1146,18 @@ class ClassifyUploadStatusTests(unittest.TestCase):
         account.refresh_token = ""
         no_remote = classify_sub2api_upload_status(account, None, 42)
         self.assertEqual(no_remote["status"], "not_uploaded")
-        self.assertIn("refresh_token", no_remote["last_error"])
+        self.assertEqual(no_remote["last_error"], "远端未找到该账号")
         remote_ok = classify_sub2api_upload_status(account, _remote(), 42)
-        self.assertEqual(remote_ok["status"], "uploaded_error")
-        self.assertIn("refresh_token", remote_ok["last_error"])
+        self.assertEqual(remote_ok["status"], "uploaded")
+        self.assertEqual(remote_ok["last_error"], "")
+
+    def test_at_only_local_account_with_remote_access_token_is_uploaded(self):
+        account = _complete_account()
+        account.refresh_token = ""
+        account.id_token = ""
+        payload = classify_sub2api_upload_status(account, _remote(), 42)
+        self.assertEqual(payload["status"], "uploaded")
+        self.assertEqual(payload["last_error"], "")
 
     def test_remote_not_in_target_group_maps_to_group_mismatch(self):
         payload = classify_sub2api_upload_status(_complete_account(), _remote(group_ids=[42]), 108)

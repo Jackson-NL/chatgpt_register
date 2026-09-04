@@ -34,7 +34,7 @@ from .registrator import (
     redact_sensitive,
     wait_spa_ready,
 )
-from .sub2api import Sub2APIClient, Sub2APIError, is_sub2api_error_account
+from .sub2api import Sub2APIClient, Sub2APIError, _extract_remote_int, is_sub2api_error_account
 
 
 MAX_LOG_LINES = 1000
@@ -305,6 +305,7 @@ def _preview_item(remote: dict[str, Any], local: Account | None, only_error: boo
         reason = "missing_profile"
     return {
         "remote_id": str(remote.get("remote_id") or ""),
+        "proxy_id": remote.get("proxy_id"),
         "email": str(remote.get("email") or ""),
         "name": str(remote.get("name") or "").split("|", 1)[0].strip(),
         "group_ids": list(remote.get("group_ids") or []),
@@ -350,6 +351,7 @@ def _safe_preview_items(raw_items: Any) -> list[dict[str, Any]]:
         items.append(
             {
                 "remote_id": str(raw.get("remote_id") or raw.get("remote_account_id") or ""),
+                "proxy_id": _extract_remote_int(raw, ("proxy_id", "proxyId")),
                 "email": str(raw.get("email") or ""),
                 "name": str(raw.get("name") or "").split("|", 1)[0].strip(),
                 "group_ids": list(raw.get("group_ids") or []),
@@ -595,6 +597,7 @@ class Sub2APIReloginService:
                 Sub2APIReloginItem(
                     job_id=job.id,
                     remote_account_id=item["remote_id"],
+                    proxy_id=item.get("proxy_id"),
                     local_account_id=item["local_account_id"],
                     email=item["email"],
                     remote_status=item["status"],
@@ -704,6 +707,7 @@ class Sub2APIReloginService:
                 await self._finish_item(job_id, item_id, "skipped", reason="missing_local")
                 return
             remote_id = item.remote_account_id
+            proxy_id = item.proxy_id
             attempts = max(1, min(3, int(config.get("retry_reauth_url", 2) or 2)))
             timeout_s = max(10, int(config.get("timeout_s", 160) or 160))
         finally:
@@ -714,7 +718,7 @@ class Sub2APIReloginService:
             work_profile_path = ""
             try:
                 await self._append_log(job_id, f"账号 #{remote_id} 开始重登（第 {attempt}/{attempts} 次）")
-                auth = await client.request_reauth_url(remote_id, _remote_reauth_redirect_uri())
+                auth = await client.request_reauth_url(remote_id, _remote_reauth_redirect_uri(), proxy_id=proxy_id)
                 await self._set_reauth_endpoint(item_id, auth.get("endpoint", ""))
                 expected_state = str(auth.get("state") or "").strip() or _extract_state(str(auth.get("auth_url") or ""))
                 auth_url_state = _extract_state(str(auth.get("auth_url") or ""))
@@ -738,9 +742,10 @@ class Sub2APIReloginService:
                     str(auth.get("session_id") or ""),
                     str(callback.get("code") or ""),
                     str(callback.get("state") or ""),
+                    proxy_id=proxy_id,
                 )
                 credentials, extra = _oauth_credentials(exchange)
-                applied = await client.apply_reauth_credentials(remote_id, credentials, extra=extra)
+                applied = await client.apply_reauth_credentials(remote_id, credentials, extra=extra, proxy_id=proxy_id)
                 await client.clear_error(remote_id)
                 await client.set_schedulable(remote_id, True)
                 _commit_relogin_profile_copy(work_profile_path, local.profile_path)

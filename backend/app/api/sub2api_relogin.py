@@ -21,6 +21,7 @@ def _item_out(item) -> dict:
         "id": item.id,
         "job_id": item.job_id,
         "remote_account_id": item.remote_account_id,
+        "proxy_id": item.proxy_id,
         "local_account_id": item.local_account_id,
         "email": item.email,
         "remote_status": item.remote_status,

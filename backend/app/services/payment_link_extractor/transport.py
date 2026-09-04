@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import random
+import threading
 import time
 import uuid
 from typing import Any, Protocol
@@ -43,9 +46,18 @@ class TransportFactory(Protocol):
     def stripe(self, config: ExtractionConfig) -> Any: ...
 
 
+_CURL_GLOBAL_LOCK = threading.Lock()
+_USE_REQUESTS_ONLY = os.getenv("OPLL_FORCE_REQUESTS", "").lower() in {"1", "true", "yes"}
+
+
 def new_session() -> Any:
-    if CurlCffiSession is not None:
-        return CurlCffiSession(impersonate="firefox")
+    if not _USE_REQUESTS_ONLY and CurlCffiSession is not None:
+        # Use chrome impersonation which is more stable on Windows; firefox
+        # profile triggers OPENSSL_internal:invalid library under concurrency.
+        try:
+            return CurlCffiSession(impersonate="chrome120")
+        except Exception:
+            return CurlCffiSession(impersonate="chrome")
     if requests is None:
         raise ConfigurationError("requests is required; install requirements.txt")
     return requests.Session()
@@ -135,6 +147,11 @@ def apply_proxy_connect_host(session: Any, proxy_url: str) -> None:
         pass
 
 
+def _is_curl_session(session: Any) -> bool:
+    # curl_cffi sessions expose .curl handle and have different thread-safety.
+    return getattr(session, "curl", None) is not None
+
+
 def stage_http_request(
     session: Any,
     stage: str,
@@ -143,21 +160,40 @@ def stage_http_request(
     log: Any | None = None,
     **kwargs: Any,
 ) -> Any:
-    started = time.perf_counter()
-    emit_log(log, f"{stage}: {method.upper()} {compact_url(url)}")
-    try:
-        response = session.request(method.upper(), url, **kwargs)
-    except Exception as exc:
-        detail = safe_log_text(exc)
-        emit_log(log, f"{stage}: request error={detail}")
-        if is_network_exception(exc):
-            raise NetworkError(stage, detail) from exc
-        raise
-    emit_log(
-        log,
-        f"{stage}: HTTP {response.status_code} elapsed={time.perf_counter() - started:.2f}s",
-    )
-    return response
+    # curl_cffi is not fully thread-safe on Windows: concurrent CONNECT via
+    # cliproxy triggers OPENSSL_internal:invalid library / WRONG_VERSION_NUMBER.
+    # Serialize curl requests globally; requests sessions remain parallel.
+    max_retries = int(os.getenv("OPLL_TRANSPORT_RETRIES", "2"))
+    is_curl = _is_curl_session(session)
+    for attempt in range(max(1, max_retries + 1)):
+        started = time.perf_counter()
+        emit_log(log, f"{stage}: {method.upper()} {compact_url(url)} attempt={attempt + 1}")
+        try:
+            if is_curl:
+                with _CURL_GLOBAL_LOCK:
+                    # Small jitter avoids thundering herd on cliproxy 3010
+                    if attempt > 0:
+                        time.sleep(random.uniform(0.3, 0.8) * attempt)
+                    response = session.request(method.upper(), url, **kwargs)
+            else:
+                response = session.request(method.upper(), url, **kwargs)
+        except Exception as exc:
+            detail = safe_log_text(exc)
+            # Retry on transport-level errors (TLS handshake, abrupt close)
+            if is_network_exception(exc) and attempt < max_retries:
+                emit_log(log, f"{stage}: retrying after transport error={detail}")
+                time.sleep(random.uniform(0.5, 1.2) * (attempt + 1))
+                continue
+            emit_log(log, f"{stage}: request error={detail}")
+            if is_network_exception(exc):
+                raise NetworkError(stage, detail) from exc
+            raise
+        emit_log(
+            log,
+            f"{stage}: HTTP {response.status_code} elapsed={time.perf_counter() - started:.2f}s",
+        )
+        return response
+    raise NetworkError(stage, "transport retries exhausted")
 
 
 def is_network_exception(exc: BaseException) -> bool:

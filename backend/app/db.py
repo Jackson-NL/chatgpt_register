@@ -248,6 +248,7 @@ def _migrate_legacy_tables(target_engine=None):
         "sub2api_relogin_items": {
             "job_id": "INTEGER",
             "remote_account_id": "VARCHAR(128) DEFAULT ''",
+            "proxy_id": "INTEGER",
             "local_account_id": "INTEGER",
             "email": "VARCHAR(128) DEFAULT ''",
             "remote_status": "VARCHAR(64) DEFAULT ''",

@@ -674,7 +674,7 @@ export default function Accounts() {
   const doSub2APIUpload = async () => {
     const uploadSelection = selectSub2APIUploadableIds(raw || [], selected);
     if (!uploadSelection.ids.length) {
-      toast("所选账号的 OAuth token 不完整，请先补 Codex OAuth 后再上传", "warning");
+      toast("所选账号缺少 access token，无法上传", "warning");
       return;
     }
     const groupIds = sub2apiGroupIdsInput.trim()
@@ -702,7 +702,7 @@ export default function Accounts() {
       setSub2apiResult(result);
       const skippedNote = result.skipped && result.skipped.length ? ` / 过滤跳过 ${result.skipped.length}` : "";
       toast(
-        `Sub2API 上传完成：成功 ${result.success} / 失败 ${result.failed}${uploadSelection.skipped.length ? ` / 跳过 token 不完整 ${uploadSelection.skipped.length}` : ""}${skippedNote}`,
+        `Sub2API 上传完成：成功 ${result.success} / 失败 ${result.failed}${uploadSelection.skipped.length ? ` / 跳过缺少 AT ${uploadSelection.skipped.length}` : ""}${skippedNote}`,
         result.failed > 0 || uploadSelection.skipped.length > 0 || (result.skipped && result.skipped.length) ? "warning" : "success",
       );
       reload();
@@ -926,13 +926,13 @@ export default function Accounts() {
         }>
         <div className="space-y-4">
           <div className="rounded-md border border-blue-100 bg-blue-50/60 p-3 text-xs leading-relaxed text-blue-800">
-            将所选账号一次上传到多个指定的 Sub2API 分组。每个账号只创建一次，后端通过 group_ids 同时绑定多个分组；账号凭据会包含 OAuth access_token、refresh_token、id_token、邮箱、密码和 2FA，页面不会展示这些字段。
+            将所选账号一次上传到多个指定的 Sub2API 分组。每个账号只创建一次，后端通过 group_ids 同时绑定多个分组；有 access token 的账号即可上传，若同时有 refresh_token / id_token 则保留完整 OAuth 自动续期能力。
           </div>
           <div className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-3 text-[13px] text-slate-600">
             <span>待上传账号</span>
             <div className="flex flex-wrap justify-end gap-2">
               <Badge color={sub2apiUploadSelection.ids.length ? "info" : "warning"} dot>{sub2apiUploadSelection.ids.length ? `可上传 ${sub2apiUploadSelection.ids.length} 个` : "无可上传账号"}</Badge>
-              {sub2apiUploadSelection.skipped.length > 0 && <Badge color="warning" dot>token 不完整跳过 {sub2apiUploadSelection.skipped.length} 个</Badge>}
+              {sub2apiUploadSelection.skipped.length > 0 && <Badge color="warning" dot>缺少 AT 跳过 {sub2apiUploadSelection.skipped.length} 个</Badge>}
             </div>
           </div>
           <div className="rounded-md border border-slate-200 p-3">
@@ -942,7 +942,7 @@ export default function Accounts() {
                 <Badge color={sub2apiUploadCounts.uploaded ? "success" : "neutral"} dot>已上传 {sub2apiUploadCounts.uploaded}</Badge>
                 <Badge color={sub2apiUploadCounts.notUploaded ? "info" : "neutral"} dot>未上传 {sub2apiUploadCounts.notUploaded}</Badge>
                 <Badge color={sub2apiUploadCounts.error ? "danger" : "neutral"} dot>异常 {sub2apiUploadCounts.error}</Badge>
-                {sub2apiUploadCounts.tokenIncomplete > 0 && <Badge color="warning" dot>token 不完整 {sub2apiUploadCounts.tokenIncomplete}</Badge>}
+                {sub2apiUploadCounts.tokenIncomplete > 0 && <Badge color="warning" dot>缺少 AT {sub2apiUploadCounts.tokenIncomplete}</Badge>}
               </div>
             </div>
             <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">

@@ -124,6 +124,7 @@ class Sub2APIReloginItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("sub2api_relogin_jobs.id"), index=True)
     remote_account_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    proxy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     local_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     email: Mapped[str] = mapped_column(String(128), default="", index=True)
     remote_status: Mapped[str] = mapped_column(String(64), default="")

@@ -22,7 +22,7 @@
 - 📱 **手机号注册**：对接 SMSBower 接码平台自动取号，在 OAuth 流程中完成 add-phone 验证；支持单浏览器会话内换号重试，号码风控自动取消并重新取号。
 - 🔄 **Codex OAuth 重授权**：复用已登录浏览器 profile 走完整 PKCE 流程换取新 `refresh_token` / `id_token`；单账号与批量（并发 1~10）均支持，登录态失效时自动用本地邮箱/密码/TOTP 恢复登录。
 - ☁️ **Sub2API 集成**：注册成功的账号一键或自动推送到 Sub2API 管理端，按分组上传、状态校验、凭据同步；远端异常账号拉回本地重登后新凭据回写并恢复调度。
-- 🔗 **提链工作台**：选择已保存 token 的账号，复用 CS/OAICS Checkout、Stripe、PayPal/GoPay/GCash 提取逻辑，后台按并发执行；页面只展示凭据是否存在，不展示完整 `access_token`。
+- 🔗 **提链工作台**：选择已保存 token 的账号，复用 CS/OAICS Checkout、Stripe、PayPal/GoPay/GCash 提取逻辑，后台按并发执行；支持 **cliproxy 出口轮换重试**（失败自动换 sid）、**Stripe 段浏览器回退**（被 bot 检测拦截时切真实 Chromium fetch）、**双出口地区改写**（如印尼链路：checkout=ID、优惠=TH）、**账号优惠目录预检**（accounts/check 自动识别试用资格与专属 campaign id，无试用资格快速失败）与 **0 元校验**；页面只展示凭据是否存在，不展示完整 `access_token`。
 - 🩺 **账号维护**：后台周期性用 `refresh_token` 刷新 AT/RT/ID Token，并调用 `wham/usage` 探测额度写回账号表。
 - 🏷️ **账号标签**：注册批次标签自动写入新账号，账号管理页支持标签筛选与批量设置/清除。
 
@@ -210,6 +210,8 @@ npm run build
 | `429/rate_limit` | 额度或接口限流 | 等待窗口恢复 |
 | Cloudflare 挑战 | IP/指纹被拦截 | 轮换代理节点，检查 Camoufox 指纹配置 |
 | `fraud_guard` | 风控拦截 | 换代理/换号段/换 profile |
+| 提链 `This promotion is not available` | 账号未被试用活动定向（`check_coupon` 的 eligible 只代表券码存在） | 以提链预检的账号优惠目录为准；无目录时该账号无法 0 元提链 |
+| 提链 `checkout/confirm blocked` | chatgpt 风控拒绝该账号支付确认 | 换出口/换账号；浏览器回退也无法绕过账号级标记 |
 | OTP 未收到 | 接码平台延迟/号码被回收 | resend 或取消换号 |
 | `响应中缺少 access_token` | OAuth token endpoint 未返回 AT | 检查 OAuth 流程是否完整 |
 

@@ -5,7 +5,7 @@ import threading
 from typing import Any, Callable
 
 from .auth import account_email, normalize_access_token
-from .checkout import check_coupon_eligibility, create_checkout, require_country_currency, update_checkout
+from .checkout import create_checkout, require_country_currency, resolve_promo_campaign, update_checkout
 from .config import (
     billing_for_country,
     country_config,
@@ -69,12 +69,21 @@ def extract_payment_link(
     chatgpt = factory.chatgpt(config, config.checkout_proxy)
     stripe = None
     try:
+        campaign_id = ""
         if config.apply_checkout_update:
             checkpoint("eligibility_check")
-            check_coupon_eligibility(config, chatgpt, log)
+            # 账号活动目录是试用资格的真实来源；无活动时不再硬编码 coupon 撞运气
+            campaign_id = resolve_promo_campaign(config, chatgpt, log)
+            if campaign_id:
+                log(f"账号命中优惠活动: {campaign_id}")
+            elif getattr(config, "require_zero_amount", False):
+                raise ConfigurationError(
+                    "账号活动目录没有可用的 plus 优惠活动（账号未被试用定向），0 元提链不可用"
+                )
         checkpoint("checkout")
-        checkout = create_checkout(config, chatgpt, log)
+        checkout = create_checkout(config, chatgpt, log, promo_campaign_id=campaign_id)
         checkpoint(f"checkout_kind:{checkout['session_kind']}")
+        checkout["promo_campaign_id"] = campaign_id
         if config.oaics_only and checkout["session_kind"] == "stripe_checkout":
             raise ConfigurationError("仅 OAICS 模式下检测到 CS Checkout，任务已失败")
         require_country_currency(checkout, config)

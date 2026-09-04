@@ -183,6 +183,7 @@ def normalize_sub2api_account(item: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "error_text": error_text,
         "totp_secret": totp_secret,
+        "proxy_id": _extract_remote_int(raw, ("proxy_id", "proxyId")),
         "concurrency": _extract_remote_int(raw, ("concurrency", "max_concurrency", "maxConcurrency")),
         "load_factor": _extract_remote_int(raw, ("load_factor", "loadFactor"), allow_zero=True),
         "raw": raw,
@@ -252,8 +253,9 @@ UPLOAD_STATUSES = {
     UPLOAD_STATUS_GROUP_MISMATCH,
 }
 
-# 本地可上传所需字段（与 build_sub2api_account_payload 一致）
-UPLOAD_REQUIRED_LOCAL_FIELDS = ("access_token", "refresh_token", "id_token")
+# AT-only 导入只要求本地存在 access_token；完整 OAuth 账号仍由
+# build_sub2api_account_payload() 额外校验 refresh_token / id_token。
+UPLOAD_REQUIRED_LOCAL_FIELDS = ("access_token",)
 
 
 def _missing_upload_fields(account: Account) -> list[str]:
@@ -273,7 +275,7 @@ def classify_sub2api_upload_status(
     1. 远端 error_text 非空                     -> remote_error
     2. 远端存在但无 access_token                 -> token_error（No access token available）
     3. 远端存在但不在目标分组                     -> group_mismatch
-    4. 远端正常但本地缺 OAuth token              -> uploaded_error（写明缺哪些字段）
+    4. 远端正常但本地缺 access_token             -> uploaded_error（写明缺哪些字段）
     5. 全部正常                                  -> uploaded
     6. 远端完全找不到                            -> not_uploaded
     """
@@ -718,6 +720,104 @@ class Sub2APIClient:
         data = self._unwrap_data(response)
         return data if isinstance(data, dict) else {}
 
+    async def import_codex_session(
+        self,
+        access_token: str,
+        group_ids: int | Iterable[int],
+        concurrency: int | None = 3,
+        *,
+        name: str = "",
+        update_existing: bool = True,
+    ) -> dict[str, Any]:
+        """通过 Sub2API 的 Codex session 导入接口上传单个 access token。
+
+        该接口原生支持没有 refresh_token / id_token 的 AT-only 账号，并会从
+        access token JWT 中补齐远端账号身份信息。返回值只保留导入结果和远端
+        账号 ID，不回显 access token。
+        """
+        token = str(access_token or "").strip()
+        if not token:
+            raise ValueError("缺少 access_token")
+        normalized_group_ids = _normalize_group_ids(group_ids)
+        normalized_concurrency = normalize_sub2api_concurrency(concurrency)
+        body: dict[str, Any] = {
+            "content": token,
+            "group_ids": normalized_group_ids,
+            "concurrency": normalized_concurrency,
+            "load_factor": normalized_concurrency,
+            "update_existing": bool(update_existing),
+            "extra": {
+                "source": "openai-register",
+                "credential_format": "access_token",
+            },
+        }
+        safe_name = str(name or "").strip()
+        if safe_name:
+            body["name"] = safe_name
+
+        response = await self._call(
+            "POST",
+            "/api/v1/admin/accounts/import/codex-session",
+            body,
+        )
+        data = self._unwrap_data(response)
+        if not isinstance(data, dict):
+            raise Sub2APIError("Sub2API Codex session 导入响应格式无效")
+
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        successful_items = [
+            item
+            for item in items
+            if isinstance(item, dict) and str(item.get("action") or "").lower() in {"created", "updated"}
+        ]
+        if not successful_items:
+            errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+            failed_item = next(
+                (
+                    item
+                    for item in items
+                    if isinstance(item, dict) and str(item.get("action") or "").lower() == "failed"
+                ),
+                None,
+            )
+            message = ""
+            if failed_item:
+                message = _as_text(failed_item.get("message"))
+            if not message and errors:
+                message = _as_text(errors[0].get("message") if isinstance(errors[0], dict) else errors[0])
+            raise Sub2APIError(f"Sub2API Codex session 导入失败{f'：{message}' if message else ''}")
+
+        item = successful_items[0]
+        remote_id = _as_text(
+            item.get("account_id")
+            or item.get("accountId")
+            or item.get("id")
+            or data.get("account_id")
+            or data.get("accountId")
+        )
+        if not remote_id:
+            raise Sub2APIError("Sub2API Codex session 导入成功但未返回远端账号 ID")
+        warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+        warning_texts = [
+            text
+            for warning in warnings
+            for text in [_as_text(warning.get("message") if isinstance(warning, dict) else warning)]
+            if text
+        ]
+        def count_value(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "remote_id": remote_id,
+            "action": str(item.get("action") or "updated").lower(),
+            "warnings": warning_texts,
+            "created": count_value(data.get("created")),
+            "updated": count_value(data.get("updated")),
+        }
+
     async def list_accounts(
         self,
         group_ids: list[int] | None = None,
@@ -755,7 +855,13 @@ class Sub2APIClient:
             try:
                 page_size = int(page_data.get("page_size") or page_data.get("pageSize") or page_data.get("per_page") or 100)
                 total = int(page_data.get("total") or page_data.get("total_count") or page_data.get("totalCount") or 0)
-                total_pages = int(page_data.get("total_pages") or page_data.get("totalPages") or page_data.get("page_count") or 0)
+                total_pages = int(
+                    page_data.get("total_pages")
+                    or page_data.get("totalPages")
+                    or page_data.get("page_count")
+                    or page_data.get("pages")
+                    or 0
+                )
             except (TypeError, ValueError):
                 page_size, total, total_pages = 100, 0, 0
             if total_pages <= 0 and total > page_size > 0:
@@ -1081,22 +1187,17 @@ class Sub2APIClient:
         upload_concurrency = normalize_sub2api_upload_concurrency(upload_concurrency)
         prepared_errors: list[dict[str, Any]] = []
         prepared: list[tuple[Account, str, dict[str, Any]]] = []
+        prepared_at_only: list[tuple[Account, str]] = []
         for account in accounts:
-            email = str(account.email or "")
-            try:
-                prepared.append(
-                    (
-                        account,
-                        email,
-                        build_sub2api_account_payload(account, normalized_group_ids, concurrency=concurrency),
-                    )
-                )
-            except ValueError:
+            email = str(account.email or "").strip()
+            access_token = str(account.access_token or "").strip()
+            if not access_token:
+                error = "缺少 access_token，无法上传"
                 prepared_errors.append(
                     {
                         "account_id": account.id,
                         "email": email,
-                        "error": "邮箱、密码、2FA 信息、access_token、refresh_token 和 id_token 必须完整",
+                        "error": error,
                     }
                 )
                 await notify_progress(
@@ -1104,9 +1205,43 @@ class Sub2APIClient:
                         "account_id": account.id,
                         "email": email,
                         "status": "failed",
-                        "error": "邮箱、密码、2FA 信息、access_token、refresh_token 和 id_token 必须完整",
+                        "error": error,
                     }
                 )
+                continue
+            # 完整 OAuth 账号继续走旧的 create/apply/update 流程；缺少 RT
+            # 或 ID token 的账号改走 Sub2API 原生 Codex session 导入。
+            if all(
+                str(getattr(account, field, "") or "").strip()
+                for field in ("email", "password", "totp_secret", "refresh_token", "id_token")
+            ):
+                try:
+                    prepared.append(
+                        (
+                            account,
+                            email,
+                            build_sub2api_account_payload(account, normalized_group_ids, concurrency=concurrency),
+                        )
+                    )
+                except ValueError:
+                    # 理论上不会触发（上面已检查字段），保留兜底以防模型字段类型异常。
+                    prepared_errors.append(
+                        {
+                            "account_id": account.id,
+                            "email": email,
+                            "error": "邮箱、密码、2FA 信息、access_token、refresh_token 和 id_token 必须完整",
+                        }
+                    )
+                    await notify_progress(
+                        {
+                            "account_id": account.id,
+                            "email": email,
+                            "status": "failed",
+                            "error": "邮箱、密码、2FA 信息、access_token、refresh_token 和 id_token 必须完整",
+                        }
+                    )
+            else:
+                prepared_at_only.append((account, email))
 
         existing_by_email: dict[str, dict[str, Any]] = {}
         if prepared:
@@ -1125,47 +1260,64 @@ class Sub2APIClient:
         async def upload_one(
             account: Account,
             email: str,
-            payload: dict[str, Any],
+            payload: dict[str, Any] | None = None,
         ) -> tuple[str, dict[str, Any]]:
             async with upload_semaphore:
                 await notify_progress({"account_id": account.id, "email": email, "status": "started"})
                 try:
-                    existing = existing_by_email.get(email.strip().lower())
-                    if existing and existing.get("remote_id"):
-                        remote_id = existing["remote_id"]
-                        desired_group_ids = _merge_remote_group_ids(existing.get("group_ids"), normalized_group_ids)
-                        await self.apply_reauth_credentials(
-                            str(remote_id),
-                            payload["credentials"],
-                            payload.get("extra"),
+                    if payload is None:
+                        imported = await self.import_codex_session(
+                            account.access_token,
+                            normalized_group_ids,
+                            concurrency=concurrency,
+                            name=email,
+                            update_existing=True,
                         )
-                        action = "updated"
-                    else:
-                        response = await self._create_account_payload(payload)
-                        remote_id = response.get("id") or ""
+                        remote_id = imported["remote_id"]
+                        action = imported.get("action") or "updated"
                         desired_group_ids = list(normalized_group_ids)
-                        if remote_id:
+                        warnings = imported.get("warnings") or []
+                    else:
+                        existing = existing_by_email.get(email.lower())
+                        if existing and existing.get("remote_id"):
+                            remote_id = existing["remote_id"]
+                            desired_group_ids = _merge_remote_group_ids(
+                                existing.get("group_ids"), normalized_group_ids
+                            )
                             await self.apply_reauth_credentials(
                                 str(remote_id),
                                 payload["credentials"],
                                 payload.get("extra"),
                             )
-                        action = "created"
-                    # 即使 apply-oauth-credentials 成功，也必须单独 PUT 同步账号设置，
-                    # 否则远端可能保留旧的 concurrency / load_factor。
-                    if remote_id:
-                        settings = {"concurrency": concurrency, "load_factor": concurrency}
-                        if existing and existing.get("remote_id"):
-                            # Sub2API 的 group_ids 是全量替换语义，更新时必须携带旧分组并集，
-                            # 否则给账号加新分组会把原有分组解绑。
-                            settings["group_ids"] = desired_group_ids
-                            # 凭据替换接口不会同步展示名称；保持账号行与最新
-                            # email||password||2fa 凭据格式一致，避免旧名称残留。
-                            settings["name"] = payload["name"]
-                        await self.update_account_settings(
-                            str(remote_id),
-                            settings,
-                        )
+                            action = "updated"
+                        else:
+                            response = await self._create_account_payload(payload)
+                            remote_id = response.get("id") or ""
+                            desired_group_ids = list(normalized_group_ids)
+                            if remote_id:
+                                await self.apply_reauth_credentials(
+                                    str(remote_id),
+                                    payload["credentials"],
+                                    payload.get("extra"),
+                                )
+                            action = "created"
+                        # 即使 apply-oauth-credentials 成功，也必须单独 PUT 同步账号设置，
+                        # 否则远端可能保留旧的 concurrency / load_factor。
+                        if remote_id:
+                            settings = {"concurrency": concurrency, "load_factor": concurrency}
+                            if existing and existing.get("remote_id"):
+                                # Sub2API 的 group_ids 是全量替换语义，更新时必须携带旧分组并集，
+                                # 否则给账号加新分组会把原有分组解绑。
+                                settings["group_ids"] = desired_group_ids
+                                # 凭据替换接口不会同步展示名称；保持账号行与最新
+                                # email||password||2fa 凭据格式一致，避免旧名称残留。
+                                settings["name"] = payload["name"]
+                            await self.update_account_settings(
+                                str(remote_id),
+                                settings,
+                            )
+                        warnings = []
+
                     verified = await self.verify_sub2api_account_uploaded(
                         remote_id,
                         email,
@@ -1187,6 +1339,8 @@ class Sub2APIClient:
                         "group_ids": desired_group_ids,
                         "remote_group_ids": verified.get("remote_group_ids"),
                     }
+                    if warnings:
+                        result["warnings"] = warnings[:10]
                     await notify_progress({"account_id": account.id, "email": email, "status": "success"})
                     return "success", result
                 except Sub2APIError as error:
@@ -1196,7 +1350,9 @@ class Sub2APIClient:
                         "error": str(error),
                         "concurrency": concurrency,
                     }
-                    await notify_progress({"account_id": account.id, "email": email, "status": "failed", "error": str(error)})
+                    await notify_progress(
+                        {"account_id": account.id, "email": email, "status": "failed", "error": str(error)}
+                    )
                     return "failed", error_result
                 except Exception:  # noqa: BLE001
                     error_result = {
@@ -1205,11 +1361,14 @@ class Sub2APIClient:
                         "error": "上传失败",
                         "concurrency": concurrency,
                     }
-                    await notify_progress({"account_id": account.id, "email": email, "status": "failed", "error": "上传失败"})
+                    await notify_progress(
+                        {"account_id": account.id, "email": email, "status": "failed", "error": "上传失败"}
+                    )
                     return "failed", error_result
 
         outcomes = await asyncio.gather(
-            *(upload_one(account, email, payload) for account, email, payload in prepared)
+            *(upload_one(account, email, payload) for account, email, payload in prepared),
+            *(upload_one(account, email) for account, email in prepared_at_only),
         )
         results = [item for status, item in outcomes if status == "success"]
         errors = prepared_errors + [item for status, item in outcomes if status == "failed"]

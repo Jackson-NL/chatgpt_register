@@ -90,16 +90,17 @@ test("buildSub2APIUploadRequest defaults concurrency to 3 when omitted", () => {
 });
 
 
-test("selectSub2APIUploadableIds keeps selected accounts that have complete OAuth tokens", () => {
+test("selectSub2APIUploadableIds keeps selected accounts that have an access token", () => {
   const accounts = [
     { id: 7, has_access_token: true, has_refresh_token: true, has_id_token: true },
-    { id: 8, has_access_token: true, has_refresh_token: false, has_id_token: true },
+    { id: 8, has_access_token: true, has_refresh_token: false, has_id_token: false },
     { id: 9, has_access_token: true, has_refresh_token: true, has_id_token: true },
+    { id: 10, has_access_token: false, has_refresh_token: true, has_id_token: true },
   ];
 
-  assert.deepEqual(selectSub2APIUploadableIds(accounts, [9, 8, 7, 404]), {
-    ids: [9, 7],
-    skipped: [8, 404],
+  assert.deepEqual(selectSub2APIUploadableIds(accounts, [9, 8, 10, 7, 404]), {
+    ids: [9, 8, 7],
+    skipped: [10, 404],
   });
 });
 
@@ -189,7 +190,7 @@ test("buildSub2APIUploadStatusQuery omits empty filters and defaults pagination"
   assert.equal(query, "page=1&page_size=20");
 });
 
-test("classifySub2APIUploadSelection counts uploaded / not_uploaded / error / token incomplete", () => {
+test("classifySub2APIUploadSelection counts uploaded / not_uploaded / error / missing access token", () => {
   const accounts = [
     { id: 1, has_access_token: true, has_refresh_token: true, has_id_token: true, sub2api_upload_summary: { status: "uploaded", uploaded_group_ids: [42] } },
     { id: 2, has_access_token: true, has_refresh_token: true, has_id_token: true, sub2api_upload_summary: { status: "not_uploaded", not_uploaded_group_ids: [42] } },
@@ -199,5 +200,5 @@ test("classifySub2APIUploadSelection counts uploaded / not_uploaded / error / to
   const summaryByAccountId = Object.fromEntries(accounts.map((a) => [a.id, a.sub2api_upload_summary]));
 
   const counts = classifySub2APIUploadSelection(accounts, [1, 2, 3, 4], summaryByAccountId);
-  assert.deepEqual(counts, { notUploaded: 1, uploaded: 1, error: 1, unknown: 0, tokenIncomplete: 1 });
+  assert.deepEqual(counts, { notUploaded: 2, uploaded: 1, error: 1, unknown: 0, tokenIncomplete: 0 });
 });

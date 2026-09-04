@@ -20,6 +20,7 @@ from ..config import (
     processor_entity_for_country,
 )
 from ..errors import ProtocolError
+from ..logging_utils import emit_log, safe_log_text
 from ..models import CheckoutData, ExtractionConfig, StripeContext
 from ..providers import provider_redirect_config
 from ..stripe_common import (
@@ -270,7 +271,16 @@ def openai_checkout_confirm(
     if response.status_code >= 400:
         raise ProtocolError(response.status_code, f"oaics checkout/confirm failed for {payment_method}: {response.text[:500]}")
     payload = response_json(response, "oaics checkout/confirm")
-    if str(payload.get("status") or "").lower() != "success" or not payload.get("client_secret"):
+    status = str(payload.get("status") or "").lower()
+    has_direct_redirect = bool(extract_redirect_to_url(payload))
+    # GoPay 等跳转支付可能不带 intent client_secret，而是直接返回跳转地址
+    if (status != "success" or not payload.get("client_secret")) and not has_direct_redirect:
+        emit_log(
+            log,
+            f"oaics checkout/confirm rejected payload: {safe_log_text(str(payload)[:600])}",
+        )
+        if status == "blocked":
+            raise ProtocolError(409, f"oaics checkout/confirm blocked: chatgpt 风控拒绝了该账号的支付确认")
         raise ProtocolError(409, f"oaics checkout/confirm rejected for {payment_method} or missing client_secret")
     return payload
 
@@ -370,10 +380,16 @@ def extract_oaics_provider(
     confirm_payload = openai_checkout_confirm(
         chatgpt, checkout, confirmation_token, payment_method, log
     )
-    intent_payload = openai_intent_confirm(
-        stripe, checkout, confirmation_token, confirm_payload, ctx, log
-    )
-    stripe_redirect = extract_redirect_to_url(intent_payload)
+    direct_redirect = extract_redirect_to_url(confirm_payload)
+    if direct_redirect and not confirm_payload.get("client_secret"):
+        # confirm 直接返回跳转地址（无 intent），无需再做 intent confirm
+        intent_payload = confirm_payload
+        stripe_redirect = direct_redirect
+    else:
+        intent_payload = openai_intent_confirm(
+            stripe, checkout, confirmation_token, confirm_payload, ctx, log
+        )
+        stripe_redirect = extract_redirect_to_url(intent_payload)
     if not stripe_redirect:
         raise ProtocolError(502, "oaics intent response missing redirect_to_url")
     provider_config = provider_redirect_config(payment_method)

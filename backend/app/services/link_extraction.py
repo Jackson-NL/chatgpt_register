@@ -20,13 +20,31 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import SessionLocal
 from ..models import Account, LinkExtractionItem, LinkExtractionJob, utcnow
+from .link_browser import BrowserExtractionContext
+from .link_proxies import apply_proxy_region, rotate_proxy_sid
 from .payment_link_extractor import extract_payment_link
 from .payment_link_extractor.config import country_config, normalize_payment_method
-from .payment_link_extractor.errors import ExtractionCancelled, NetworkError
+from .payment_link_extractor.errors import (
+    ConfigurationError,
+    ExtractionCancelled,
+    NetworkError,
+    ProtocolError,
+)
 from .payment_link_extractor.models import ExtractionConfig
 
 
 MAX_LOG_LINES = 2000
+MAX_EXTRACTION_ATTEMPTS = 20
+# 这些错误来自 Stripe 段（bot 检测），HTTP 出口轮换解决不了，需要切浏览器链路
+_STRIPE_BLOCK_MARKERS = (
+    "stripe init failed",
+    "elements session",
+    "payment_pages",
+    "setup_intent",
+    "client_secret",
+    "payment_methods failed",
+    "stripe confirm failed",
+)
 STAGE_PROGRESS = {
     "queued": 0,
     "eligibility_check": 10,
@@ -85,6 +103,30 @@ def _stage_name(stage: str) -> tuple[str, str]:
     return value, ""
 
 
+def _classify_failure(error: BaseException) -> str:
+    """失败分类：fatal 不重试；stripe 切浏览器链路；risk/network 轮换出口重试。"""
+    if isinstance(error, ConfigurationError):
+        return "fatal"
+    text = str(error).lower()
+    if "unusual activity" in text or "manual approval blocked" in text:
+        return "risk"
+    if "this promotion is not available" in text:
+        # 优惠在该 update 出口不可用；若与 checkout 不同出口，可回退同出口重试一次
+        return "promo_region"
+    if isinstance(error, ProtocolError):
+        if any(marker in text for marker in _STRIPE_BLOCK_MARKERS):
+            return "stripe"
+        if error.status_code == 401:
+            # token 失效或 promo 资格类问题，重试无意义
+            return "fatal"
+        if "promo eligibility" in text:
+            return "fatal"
+        return "risk"
+    if isinstance(error, NetworkError):
+        return "network"
+    return "risk"
+
+
 class LinkExtractionService:
     def __init__(self, extractor: Callable[..., Any] | None = None):
         self.extractor = extractor or extract_payment_link
@@ -135,6 +177,17 @@ class LinkExtractionService:
         oaics_only = bool(_payload_value(payload, "oaics_only", False))
         checkout_proxy = str(_payload_value(payload, "checkout_proxy", "") or "").strip()
         update_proxy = str(_payload_value(payload, "update_proxy", "") or "").strip()
+        max_attempts = max(1, min(20, int(_payload_value(payload, "max_attempts", 6) or 6)))
+        rotate_proxy = bool(_payload_value(payload, "rotate_proxy", True))
+        browser_fallback = bool(_payload_value(payload, "browser_fallback", True))
+        require_zero_amount = bool(_payload_value(payload, "require_zero_amount", False))
+        checkout_region = str(_payload_value(payload, "checkout_region", "") or "").strip().upper()
+        update_region = str(_payload_value(payload, "update_region", "") or "").strip().upper()
+        promo_campaign_id = str(_payload_value(payload, "promo_campaign_id", "") or "").strip()
+        for region in (checkout_region, update_region):
+            if region:
+                # 仅校验合法国家码；region 与 country 可以不同（如 ID 出口 + TH 优惠）
+                country_config(region)
 
         account_map = {account.id: account for account in db.scalars(select(Account).where(Account.id.in_(account_ids))).all()}
         missing_ids = [str(account_id) for account_id in account_ids if account_id not in account_map]
@@ -162,6 +215,13 @@ class LinkExtractionService:
                     "payment_method": payment_method,
                     "apply_checkout_update": apply_update,
                     "oaics_only": oaics_only,
+                    "max_attempts": max_attempts,
+                    "rotate_proxy": rotate_proxy,
+                    "browser_fallback": browser_fallback,
+                    "require_zero_amount": require_zero_amount,
+                    "checkout_region": checkout_region,
+                    "update_region": update_region,
+                    "promo_campaign_id": promo_campaign_id,
                 },
                 ensure_ascii=False,
             ),
@@ -290,6 +350,32 @@ class LinkExtractionService:
         finally:
             db.close()
 
+    def _extract_once(
+        self,
+        config: ExtractionConfig,
+        *,
+        use_browser: bool,
+        cancel_event: threading.Event,
+        stage_callback: Callable[[str], None],
+        log_callback: Callable[[str], None],
+    ) -> Any:
+        """单次提链；use_browser 时 Stripe 段走真实 Chromium（混合链路）。"""
+        if not use_browser:
+            return self.extractor(
+                config,
+                cancel_event=cancel_event,
+                stage_callback=stage_callback,
+                log_callback=log_callback,
+            )
+        with BrowserExtractionContext(config.checkout_proxy, country=config.country) as factory:
+            return self.extractor(
+                config,
+                transport_factory=factory,
+                cancel_event=cancel_event,
+                stage_callback=stage_callback,
+                log_callback=log_callback,
+            )
+
     async def _run_item(self, job_id: int, item_id: int, config: dict[str, Any]) -> None:
         if not await self._mark_running(job_id, item_id):
             return
@@ -297,22 +383,19 @@ class LinkExtractionService:
         try:
             item = db.get(LinkExtractionItem, item_id)
             account = db.get(Account, item.account_id) if item else None
-            job = db.get(LinkExtractionJob, job_id)
-            if not item or not account or not job:
+            if not item or not account:
                 await self._finish_item(job_id, item_id, "failed", error="账号记录不存在")
                 return
-            checkout_proxy = str(config.get("checkout_proxy") or account.proxy or settings.default_proxy or "").strip()
-            update_proxy = str(config.get("update_proxy") or checkout_proxy).strip()
-            extraction_config = ExtractionConfig(
-                access_token=account.access_token,
-                checkout_proxy=checkout_proxy,
-                update_proxy=update_proxy,
-                country=str(config.get("country") or "GB"),
-                payment_method=str(config.get("payment_method") or "paypal"),
-                apply_checkout_update=bool(config.get("apply_checkout_update", True)),
-                verbose=False,
-                oaics_only=bool(config.get("oaics_only", False)),
-            )
+            base_checkout_proxy = str(config.get("checkout_proxy") or account.proxy or settings.default_proxy or "").strip()
+            base_update_proxy = str(config.get("update_proxy") or "").strip()
+            country = str(config.get("country") or "GB")
+            payment_method = str(config.get("payment_method") or "paypal")
+            max_attempts = max(1, min(MAX_EXTRACTION_ATTEMPTS, int(config.get("max_attempts") or 6)))
+            rotate_proxy = bool(config.get("rotate_proxy", True))
+            browser_fallback = bool(config.get("browser_fallback", True))
+            require_zero = bool(config.get("require_zero_amount", False))
+            checkout_region = str(config.get("checkout_region") or "").strip().upper()
+            update_region = str(config.get("update_region") or "").strip().upper()
         finally:
             db.close()
 
@@ -332,23 +415,83 @@ class LinkExtractionService:
         def log_callback(message: str) -> None:
             call_on_loop(self._append_log(job_id, f"账号 #{item_id}: {message}"))
 
-        await self._append_log(job_id, f"账号 #{item_id} 开始提链")
-        try:
-            result = await asyncio.to_thread(
-                self.extractor,
-                extraction_config,
-                cancel_event=cancel_event,
-                stage_callback=stage_callback,
-                log_callback=log_callback,
+        def build_config(checkout_proxy: str, update_proxy: str, use_browser: bool) -> ExtractionConfig:
+            return ExtractionConfig(
+                access_token=account.access_token,
+                checkout_proxy=checkout_proxy,
+                update_proxy=update_proxy or checkout_proxy,
+                country=country,
+                payment_method=payment_method,
+                apply_checkout_update=bool(config.get("apply_checkout_update", True)),
+                verbose=False,
+                oaics_only=bool(config.get("oaics_only", False)),
+                promo_campaign_id=str(config.get("promo_campaign_id") or "").strip(),
+                require_zero_amount=bool(config.get("require_zero_amount", False)),
             )
+
+        await self._append_log(job_id, f"账号 #{item_id} 开始提链（最多 {max_attempts} 次尝试）")
+        attempts = 0
+        use_browser = False
+        while True:
+            attempts += 1
+            checkout_proxy = rotate_proxy_sid(base_checkout_proxy) if rotate_proxy else base_checkout_proxy
+            if checkout_region:
+                checkout_proxy = apply_proxy_region(checkout_proxy, checkout_region)
+            if base_update_proxy:
+                update_proxy = rotate_proxy_sid(base_update_proxy) if rotate_proxy else base_update_proxy
+                if update_region:
+                    update_proxy = apply_proxy_region(update_proxy, update_region)
+            elif update_region:
+                # 无显式 update 代理时，从 checkout 出口派生一个独立 sid 的 update_region 出口
+                update_proxy = apply_proxy_region(rotate_proxy_sid(checkout_proxy), update_region)
+            else:
+                update_proxy = ""
+            mode_label = "浏览器混合" if use_browser else "HTTP"
+            await self._append_log(job_id, f"账号 #{item_id} 第 {attempts}/{max_attempts} 次尝试（{mode_label} 链路）")
+            try:
+                result = await asyncio.to_thread(
+                    self._extract_once,
+                    build_config(checkout_proxy, update_proxy, use_browser),
+                    use_browser=use_browser,
+                    cancel_event=cancel_event,
+                    stage_callback=stage_callback,
+                    log_callback=log_callback,
+                )
+            except ExtractionCancelled:
+                await self._finish_item(job_id, item_id, "canceled", error="任务已取消")
+                return
+            except Exception as error:  # noqa: BLE001
+                category = _classify_failure(error)
+                await self._append_log(job_id, f"账号 #{item_id} 第 {attempts} 次尝试失败：{_safe_log_text(error, 300)}")
+                if (
+                    category == "promo_region"
+                    and update_region
+                    and update_region != checkout_region
+                ):
+                    # 参考 GoPay 项目经验：优惠可用国家因活动而异（plus-1-month-free=TH，
+                    # plus-1-month-50-pct-off=ID）。update 出口被拒时回退 checkout 同出口。
+                    update_region = checkout_region
+                    await self._append_log(job_id, f"账号 #{item_id} 优惠在原 update 出口被拒，改用 checkout 同出口（{checkout_region}）重试")
+                    continue
+                if category == "promo_region" or category == "fatal" or attempts >= max_attempts or cancel_event.is_set():
+                    await self._finish_item(job_id, item_id, "failed", error=str(error), network_error=isinstance(error, NetworkError))
+                    return
+                if category == "stripe" and browser_fallback and not use_browser:
+                    use_browser = True
+                    await self._append_log(job_id, f"账号 #{item_id} Stripe 段疑似被 bot 检测拦截，切换浏览器混合链路")
+                continue
+
             result_dict = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+            result_dict["attempts"] = attempts
+            result_dict["transport"] = "browser_hybrid" if use_browser else "http"
+            if require_zero and int(result_dict.get("amount_due_minor") or 0) != 0:
+                message = f"优惠后金额非 0：{result_dict.get('amount_due')} {result_dict.get('currency')}"
+                await self._append_log(job_id, f"账号 #{item_id} 0 元校验失败：{message}")
+                await self._finish_item(job_id, item_id, "failed", result=result_dict, error=message)
+                return
             await self._finish_item(job_id, item_id, "succeeded", result=result_dict)
-            await self._append_log(job_id, f"账号 #{item_id} 提链成功")
-        except ExtractionCancelled:
-            await self._finish_item(job_id, item_id, "canceled", error="任务已取消")
-        except Exception as error:  # noqa: BLE001
-            await self._finish_item(job_id, item_id, "failed", error=str(error), network_error=isinstance(error, NetworkError))
-            await self._append_log(job_id, f"账号 #{item_id} 提链失败: {_safe_log_text(error, 300)}")
+            await self._append_log(job_id, f"账号 #{item_id} 提链成功（{attempts} 次尝试，{result_dict.get('transport')}）")
+            return
 
     async def run_job(self, job_id: int) -> None:
         db = SessionLocal()

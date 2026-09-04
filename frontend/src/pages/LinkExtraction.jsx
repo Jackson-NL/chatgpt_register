@@ -18,6 +18,7 @@ import { api } from "../api";
 import { useApp } from "../context/AppContext";
 import {
   DEFAULT_LINK_EXTRACTION_FORM,
+  INDONESIA_ZERO_PRESET,
   LINK_COUNTRIES,
   LINK_PAYMENT_METHODS,
   buildLinkExtractionPayload,
@@ -196,6 +197,10 @@ export default function LinkExtraction() {
   }, [job?.id, job?.status, pollJob]);
 
   const updateForm = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const applyZeroPreset = () => {
+    setForm((current) => ({ ...current, ...INDONESIA_ZERO_PRESET }));
+    toast("已套用印尼 0 元模板：ID 出口建单 + TH 出口优惠 + 0 元校验", "info");
+  };
   const start = async () => {
     if (!selected.size) { toast("请至少选择一个账号", "warning"); return; }
     if (job && linkJobActive(job.status)) return;
@@ -223,7 +228,10 @@ export default function LinkExtraction() {
   const active = Boolean(job && linkJobActive(job.status));
   const status = linkStatusMeta(job?.status);
   const selectedCount = selected.size;
-  const configSummary = useMemo(() => `${form.country} · ${form.payment_method} · 并发 ${form.concurrency}`, [form]);
+  const configSummary = useMemo(
+    () => `${form.country} · ${form.payment_method} · 并发 ${form.concurrency}${form.require_zero_amount ? " · 0元校验" : ""}`,
+    [form],
+  );
 
   return (
     <div className="space-y-3">
@@ -231,7 +239,17 @@ export default function LinkExtraction() {
 
       <div className="grid gap-3 xl:grid-cols-[minmax(0,1.25fr)_minmax(320px,0.75fr)]">
         <AccountPicker data={accounts} selected={selected} setSelected={setSelected} loading={accountLoading} error={accountError} onRetry={loadAccounts} search={accountSearch} setSearch={setAccountSearch} page={accountPage} setPage={setAccountPage} pageSize={accountPageSize} setPageSize={setAccountPageSize} />
-        <Panel title="提链参数" extra={<span className="text-[11px] text-slate-400">{configSummary}</span>}>
+        <Panel
+          title="提链参数"
+          extra={
+            <span className="flex items-center gap-2">
+              <span className="text-[11px] text-slate-400">{configSummary}</span>
+              <button onClick={applyZeroPreset} className="rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-600 hover:bg-blue-100">
+                印尼 0 元模板
+              </button>
+            </span>
+          }
+        >
           <div className="space-y-3">
             <div className="grid gap-3 sm:grid-cols-2">
               <Input label="Checkout Proxy" value={form.checkout_proxy} onChange={(event) => updateForm("checkout_proxy", event.target.value)} placeholder="留空使用账号代理" />
@@ -242,8 +260,17 @@ export default function LinkExtraction() {
               <Select label="支付方式" value={form.payment_method} onChange={(value) => updateForm("payment_method", value)} options={LINK_PAYMENT_METHODS} />
               <Input label="并发数" type="number" min="1" max="5" value={form.concurrency} onChange={(event) => updateForm("concurrency", event.target.value)} />
             </div>
+            <div className="grid gap-3 border-t border-slate-100 pt-3 sm:grid-cols-3">
+              <Input label="Checkout 出口地区" value={form.checkout_region} onChange={(event) => updateForm("checkout_region", event.target.value)} placeholder="如 ID（改写 cliproxy region）" />
+              <Input label="Update 出口地区" value={form.update_region} onChange={(event) => updateForm("update_region", event.target.value)} placeholder="如 TH（留空跟随 checkout）" />
+              <Input label="单账号重试次数" type="number" min="1" max="20" value={form.max_attempts} onChange={(event) => updateForm("max_attempts", event.target.value)} />
+              <Input label="优惠活动 ID" value={form.promo_campaign_id} onChange={(event) => updateForm("promo_campaign_id", event.target.value)} placeholder="留空自动读取账号优惠目录" />
+            </div>
             <div className="space-y-2 border-t border-slate-100 pt-3">
-              <Switch checked={form.apply_checkout_update} onChange={(value) => updateForm("apply_checkout_update", value)} label="执行 Checkout 更新" />
+              <Switch checked={form.rotate_proxy} onChange={(value) => updateForm("rotate_proxy", value)} label="失败后自动轮换出口（cliproxy sid）" />
+              <Switch checked={form.browser_fallback} onChange={(value) => updateForm("browser_fallback", value)} label="Stripe 段被拦截时切换浏览器链路" />
+              <Switch checked={form.require_zero_amount} onChange={(value) => updateForm("require_zero_amount", value)} label="0 元校验（金额非 0 判为失败）" />
+              <Switch checked={form.apply_checkout_update} onChange={(value) => updateForm("apply_checkout_update", value)} label="执行 Checkout 更新（优惠资格检查 + 应用）" />
               <Switch checked={form.oaics_only} onChange={(value) => updateForm("oaics_only", value)} label="仅处理 OAICS Checkout" />
             </div>
             <div className="rounded-md bg-blue-50 px-3 py-2 text-[11px] leading-relaxed text-blue-700">已选择 {selectedCount} 个账号。提链过程只读取后端账号凭据，页面不显示 access token。</div>

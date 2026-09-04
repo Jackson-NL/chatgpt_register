@@ -177,6 +177,13 @@ class LinkExtractionCreate(BaseModel):
     apply_checkout_update: bool = True
     oaics_only: bool = False
     concurrency: int = Field(default=2, ge=1, le=5)
+    max_attempts: int = Field(default=6, ge=1, le=20)
+    rotate_proxy: bool = True
+    browser_fallback: bool = True
+    require_zero_amount: bool = False
+    checkout_region: str = ""
+    update_region: str = ""
+    promo_campaign_id: str = ""
 
 
 class LinkExtractionJobOut(OrmModel):

@@ -60,7 +60,7 @@ export function selectSub2APIUploadableIds(accounts = [], selectedIds = []) {
     const id = Number(rawId);
     if (!Number.isInteger(id) || id <= 0) continue;
     const account = byId.get(id);
-    if (account?.has_access_token && account?.has_refresh_token && account?.has_id_token) ids.push(id);
+    if (account?.has_access_token) ids.push(id);
     else skipped.push(id);
   }
   return { ids, skipped };
@@ -144,7 +144,7 @@ export function classifySub2APIUploadSelection(accounts = [], selectedIds = [], 
       counts.unknown += 1;
       continue;
     }
-    if (!(account.has_access_token && account.has_refresh_token && account.has_id_token)) {
+    if (!account.has_access_token) {
       counts.tokenIncomplete += 1;
       continue;
     }
